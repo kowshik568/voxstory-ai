@@ -1,0 +1,6 @@
+{
+  "name": "VoxStory AI - Expressive AI Voice Studio",
+  "description": "Direct expressive AI voiceovers using Gnani Timbre v3.0 with inline emotion tags, voice selection, pacing, and realistic audio performance.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
