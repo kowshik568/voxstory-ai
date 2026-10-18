@@ -1,10 +1,11 @@
 /**
- * VoxStory AI - Generation History Log (v4.0)
- * Precision audit table of all audio takes generated during the session.
- * Real playback, waveform preview, take comparison, and instant downloads.
+ * VoxStory AI - Generation History Log (v13.0)
+ * Searchable, persistent audit log of all speech takes.
+ * Real audio playback, script recovery, instant WAV downloads,
+ * and individual take or full log management.
  */
 
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import {
   History,
   Play,
@@ -19,6 +20,9 @@ import {
   ShieldCheck,
   Cpu,
   Trash2,
+  Search,
+  ExternalLink,
+  RefreshCw,
 } from 'lucide-react';
 import { GenerationResult } from '../types';
 
@@ -27,17 +31,52 @@ interface HistoryViewProps {
   activeTake: GenerationResult | null;
   onSelectTake: (take: GenerationResult) => void;
   onClearHistory: () => void;
+  onOpenInStudio?: (take: GenerationResult) => void;
+  onDeleteTake?: (id: string) => void;
 }
 
 export const HistoryView: React.FC<HistoryViewProps> = ({
-  history,
+  history: propHistory,
   activeTake,
   onSelectTake,
   onClearHistory,
+  onOpenInStudio,
+  onDeleteTake,
 }) => {
+  const [historyList, setHistoryList] = useState<GenerationResult[]>(propHistory);
+  const [searchQuery, setSearchQuery] = useState('');
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // Sync when parent history changes
+  useEffect(() => {
+    setHistoryList(propHistory);
+  }, [propHistory]);
+
+  // Fetch persisted history from backend on mount
+  const fetchBackendHistory = async () => {
+    setIsRefreshing(true);
+    try {
+      const res = await fetch('/api/generations');
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.data)) {
+          setHistoryList(json.data);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to fetch generation history:', e);
+    } finally {
+      setIsRefreshing(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchBackendHistory();
+  }, []);
 
   const togglePlay = (take: GenerationResult) => {
     if (playingId === take.id) {
@@ -65,10 +104,36 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
   const handleDownload = (take: GenerationResult) => {
     const a = document.createElement('a');
     a.href = take.audioUrl;
-    a.download = `${take.title.toLowerCase().replace(/[^a-z0-9]/g, '_')}_${take.id}.wav`;
+    const safeTitle = (take.title || 'voxstory_take')
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, '_');
+    a.download = `${safeTitle}_${take.voice.toLowerCase()}_${take.id}.wav`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
+  };
+
+  const handleDeleteTake = async (id: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    try {
+      await fetch(`/api/generations/${id}`, { method: 'DELETE' });
+      setHistoryList((prev) => prev.filter((t) => t.id !== id));
+      if (onDeleteTake) onDeleteTake(id);
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleClearAll = async () => {
+    if (window.confirm('Are you sure you want to clear your entire generation history?')) {
+      try {
+        await fetch('/api/generations', { method: 'DELETE' });
+        setHistoryList([]);
+        onClearHistory();
+      } catch {
+        // ignore
+      }
+    }
   };
 
   const formatDuration = (seconds: number) => {
@@ -78,8 +143,17 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
     return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}.${ms}`;
   };
 
+  const filteredHistory = historyList.filter((t) => {
+    const q = searchQuery.toLowerCase();
+    return (
+      t.title.toLowerCase().includes(q) ||
+      t.script.toLowerCase().includes(q) ||
+      t.voice.toLowerCase().includes(q)
+    );
+  });
+
   return (
-    <div className="flex-1 bg-[#0B0C10] overflow-y-auto p-6 lg:p-8 space-y-6">
+    <div className="flex-1 bg-[#0B0C10] overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-6">
       {/* Hidden audio element for preview */}
       <audio ref={audioRef} />
 
@@ -89,7 +163,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           <h1 className="text-xl font-bold tracking-tight text-white flex items-center gap-2">
             <span>Generation History Log</span>
             <span className="text-xs font-mono text-violet-400 font-normal px-2 py-0.5 rounded bg-violet-950/40 border border-violet-800/40 tabular-nums">
-              {history.length} Takes
+              {historyList.length} Takes
             </span>
           </h1>
           <p className="text-xs text-[#8E92A8] mt-1">
@@ -97,24 +171,50 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
           </p>
         </div>
 
-        {history.length > 0 && (
+        {/* Search & Actions */}
+        <div className="flex items-center gap-2.5">
+          <div className="relative">
+            <Search className="w-3.5 h-3.5 text-[#6A6E85] absolute left-3 top-2.5 pointer-events-none" />
+            <input
+              type="text"
+              placeholder="Filter takes by text or voice..."
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              className="w-56 sm:w-64 h-8 bg-[#11131C] border border-[#202334] rounded-lg pl-8 pr-3 text-xs text-white placeholder-[#60647E] focus:outline-none focus:border-violet-500 transition-colors"
+            />
+          </div>
+
           <button
-            onClick={onClearHistory}
-            className="h-8 px-3 rounded-lg bg-[#161824] hover:bg-rose-950/30 text-[#8E92A8] hover:text-rose-400 border border-[#202334] text-xs font-medium flex items-center gap-1.5 transition-colors"
+            onClick={fetchBackendHistory}
+            title="Refresh History"
+            className="w-8 h-8 rounded-lg bg-[#151722] hover:bg-[#1C1F2E] border border-[#202334] text-[#8E92A8] hover:text-white flex items-center justify-center transition-colors"
           >
-            <Trash2 className="w-3.5 h-3.5" />
-            <span>Clear History</span>
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin' : ''}`} />
           </button>
-        )}
+
+          {historyList.length > 0 && (
+            <button
+              onClick={handleClearAll}
+              className="h-8 px-3 rounded-lg bg-[#161824] hover:bg-rose-950/30 text-[#8E92A8] hover:text-rose-400 border border-[#202334] text-xs font-medium flex items-center gap-1.5 transition-colors"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">Clear History</span>
+            </button>
+          )}
+        </div>
       </div>
 
       {/* Takes Table */}
-      {history.length === 0 ? (
+      {filteredHistory.length === 0 ? (
         <div className="text-center py-20 px-4 border border-dashed border-[#202334] rounded-xl bg-[#0E1017]">
           <History className="w-10 h-10 text-[#4E5268] mx-auto mb-3" />
-          <h3 className="text-sm font-semibold text-white">No audio takes recorded yet</h3>
+          <h3 className="text-sm font-semibold text-white">
+            {searchQuery ? 'No takes matched your search' : 'No audio takes recorded yet'}
+          </h3>
           <p className="text-xs text-[#71758C] mt-1 max-w-sm mx-auto">
-            Generate speech in the Solo Narration or Dialogue Studio to build your session history log.
+            {searchQuery
+              ? 'Try searching with a different term or clear the filter.'
+              : 'Generate speech in the Voice Studio or Dialogue Studio to build your session history log.'}
           </p>
         </div>
       ) : (
@@ -133,7 +233,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#181B27]">
-                {history.map((take) => {
+                {filteredHistory.map((take) => {
                   const isPlaying = playingId === take.id;
                   const isActive = activeTake?.id === take.id;
                   const isCopied = copiedId === take.id;
@@ -177,7 +277,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                       <td className="py-3 px-4">
                         <div className="text-white font-medium">{take.voice}</div>
                         <div className="text-[10px] text-[#71758C] font-mono">
-                          {take.language} · {take.audioConfig.sampleRate}Hz
+                          {take.language} · {take.audioConfig?.sampleRate || 24000}Hz
                         </div>
                       </td>
 
@@ -225,7 +325,7 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                       {/* Actions */}
                       <td className="py-3 px-4 text-right">
                         <div className="flex items-center justify-end gap-1.5">
-                          {/* Set Active */}
+                          {/* Load into master player */}
                           <button
                             onClick={() => onSelectTake(take)}
                             title="Load into Master Player"
@@ -233,6 +333,17 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                           >
                             Load
                           </button>
+
+                          {/* Open in Studio */}
+                          {onOpenInStudio && (
+                            <button
+                              onClick={() => onOpenInStudio(take)}
+                              title="Open Script in Studio"
+                              className="p-1.5 rounded bg-[#181B28] hover:bg-[#202436] text-[#8E92A8] hover:text-white transition-colors"
+                            >
+                              <ExternalLink className="w-3.5 h-3.5" />
+                            </button>
+                          )}
 
                           {/* Copy Transcript */}
                           <button
@@ -254,6 +365,15 @@ export const HistoryView: React.FC<HistoryViewProps> = ({
                             className="p-1.5 rounded bg-violet-600/20 hover:bg-violet-600/40 text-violet-300 transition-colors"
                           >
                             <Download className="w-3.5 h-3.5" />
+                          </button>
+
+                          {/* Delete Take */}
+                          <button
+                            onClick={(e) => handleDeleteTake(take.id, e)}
+                            title="Delete take"
+                            className="p-1.5 rounded hover:bg-rose-950/30 text-[#60647E] hover:text-rose-400 transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
                           </button>
                         </div>
                       </td>

@@ -10,6 +10,8 @@ import {
   createDefaultMultitrackSetup,
 } from '../lib/multitrackEngine';
 import { TimelineClip, TimelineTrack } from '../types';
+import { generateProceduralSpeechWav } from '../lib/audioGenerator';
+import { createWavHeader } from '../lib/audioStitcher';
 
 describe('VoxStory Multitrack DAW Engine (v7.0)', () => {
   const { tracks, clips } = createDefaultMultitrackSetup();
@@ -138,5 +140,39 @@ describe('VoxStory Multitrack DAW Engine (v7.0)', () => {
     expect(mix.durationSeconds).toBeGreaterThan(0);
     expect(mix.sizeBytes).toBeGreaterThan(44);
     expect(mix.dataUrl).toBeDefined();
+  });
+
+  it('correctly decodes real 16-bit PCM WAV base64 data for timeline mixing', async () => {
+    // Generate 16-bit PCM WAV bytes and encode to base64 data URI
+    const numSamples = 24000;
+    const dataSize = numSamples * 2;
+    const header = createWavHeader(dataSize, 24000);
+    const wavBytes = new Uint8Array(44 + dataSize);
+    wavBytes.set(header, 0);
+
+    const view = new DataView(wavBytes.buffer);
+    for (let i = 0; i < numSamples; i++) {
+      const s = Math.sin(2 * Math.PI * 440 * (i / 24000));
+      view.setInt16(44 + i * 2, s * 0x7fff, true);
+    }
+    const b64 = Buffer.from(wavBytes).toString('base64');
+    const wavDataUrl = `data:audio/wav;base64,${b64}`;
+
+    const realClip: TimelineClip = {
+      id: 'clip-real-take',
+      trackId: tracks[0].id,
+      title: 'Real Recorded Take',
+      startTime: 0,
+      duration: 1.0,
+      fadeIn: 0.1,
+      fadeOut: 0.1,
+      volume: 0.9,
+      pan: 0.2,
+      audioUrl: wavDataUrl,
+    };
+
+    const finalMaster = await mixMultitrackTimeline([tracks[0]], [realClip], 24000);
+    expect(finalMaster.durationSeconds).toBeGreaterThanOrEqual(10.0);
+    expect(finalMaster.sizeBytes).toBeGreaterThan(44);
   });
 });

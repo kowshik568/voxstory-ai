@@ -53,5 +53,27 @@ describe('Audio Validator', () => {
     expect(result.isValid).toBe(true);
     expect(result.sampleRate).toBe(16000);
     expect(result.durationSeconds).toBe(1);
+    expect(Array.isArray(result.warnings)).toBe(true);
+  });
+
+  it('reports clipping and low-signal warnings without failing structural WAV validation', () => {
+    const sampleRate = 24000;
+    const numSamples = 24000; // 1 second
+    const dataSize = numSamples * 2;
+    const header = createWavHeader(dataSize, sampleRate);
+
+    const buffer = Buffer.alloc(44 + dataSize);
+    header.forEach((byte, i) => (buffer[i] = byte));
+
+    // Fill with high-amplitude samples triggering clipping
+    for (let i = 0; i < 20; i++) {
+      buffer.writeInt16LE(32767, 44 + i * 2);
+    }
+
+    const result = validateWavBuffer(buffer);
+    expect(result.isValid).toBe(true);
+    expect(result.isClipping).toBe(true);
+    expect(result.warnings?.some((w) => w.includes('clipping warning'))).toBe(true);
   });
 });
+

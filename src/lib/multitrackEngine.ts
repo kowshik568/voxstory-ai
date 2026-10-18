@@ -160,6 +160,169 @@ export function generateSubtitlesFromMultitrack(
 }
 
 /**
+ * Extracts 16-bit PCM samples from a base64 WAV data URL and resamples if needed
+ */
+export function extractSamplesFromWavDataUrl(
+  dataUrl: string,
+  targetSampleRate: number
+): Float32Array | null {
+  try {
+    if (!dataUrl || !dataUrl.includes('base64,')) return null;
+    const base64 = dataUrl.split('base64,')[1];
+    if (!base64) return null;
+
+    let binaryStr = '';
+    if (typeof atob === 'function') {
+      binaryStr = atob(base64);
+    } else if (typeof Buffer !== 'undefined') {
+      binaryStr = Buffer.from(base64, 'base64').toString('binary');
+    } else {
+      return null;
+    }
+
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) {
+      bytes[i] = binaryStr.charCodeAt(i);
+    }
+
+    if (bytes.length < 44) return null;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+
+    // Verify RIFF & WAVE headers
+    const riff = String.fromCharCode(view.getUint8(0), view.getUint8(1), view.getUint8(2), view.getUint8(3));
+    const wave = String.fromCharCode(view.getUint8(8), view.getUint8(9), view.getUint8(10), view.getUint8(11));
+    if (riff !== 'RIFF' || wave !== 'WAVE') return null;
+
+    let offset = 12;
+    let srcSampleRate = 24000;
+    let dataOffset = 44;
+    let dataLength = bytes.length - 44;
+
+    while (offset + 8 <= bytes.length) {
+      const chunkId = String.fromCharCode(
+        view.getUint8(offset),
+        view.getUint8(offset + 1),
+        view.getUint8(offset + 2),
+        view.getUint8(offset + 3)
+      );
+      const chunkSize = view.getUint32(offset + 4, true);
+
+      if (chunkId === 'fmt ' && offset + 16 <= bytes.length) {
+        srcSampleRate = view.getUint32(offset + 12, true);
+      } else if (chunkId === 'data') {
+        dataOffset = offset + 8;
+        dataLength = Math.min(chunkSize, bytes.length - dataOffset);
+        break;
+      }
+      offset += 8 + chunkSize;
+    }
+
+    const numSamples = Math.floor(dataLength / 2);
+    if (numSamples <= 0) return null;
+
+    const rawSamples = new Float32Array(numSamples);
+    for (let i = 0; i < numSamples; i++) {
+      const val = view.getInt16(dataOffset + i * 2, true);
+      rawSamples[i] = val < 0 ? val / 32768 : val / 32767;
+    }
+
+    // Resample if necessary
+    if (srcSampleRate === targetSampleRate) {
+      return rawSamples;
+    }
+
+    const ratio = srcSampleRate / targetSampleRate;
+    const targetLength = Math.floor(numSamples / ratio);
+    const resampled = new Float32Array(targetLength);
+    for (let i = 0; i < targetLength; i++) {
+      const srcIdx = i * ratio;
+      const idxFloor = Math.floor(srcIdx);
+      const frac = srcIdx - idxFloor;
+      const s0 = rawSamples[idxFloor] || 0;
+      const s1 = rawSamples[idxFloor + 1] || s0;
+      resampled[i] = s0 + frac * (s1 - s0);
+    }
+
+    return resampled;
+  } catch {
+    return null;
+  }
+}
+
+const clipSampleCache = new Map<string, Float32Array>();
+
+/**
+ * Preloads and decodes audio samples for clips with remote or data URLs
+ */
+export async function preloadClipSamples(clips: TimelineClip[], sampleRate: number): Promise<void> {
+  for (const clip of clips) {
+    if (!clip.audioUrl || clipSampleCache.has(clip.audioUrl)) continue;
+    try {
+      if (clip.audioUrl.startsWith('data:audio/')) {
+        const decoded = extractSamplesFromWavDataUrl(clip.audioUrl, sampleRate);
+        if (decoded) clipSampleCache.set(clip.audioUrl, decoded);
+      } else if (typeof fetch === 'function') {
+        const res = await fetch(clip.audioUrl);
+        if (res.ok) {
+          const arrayBuf = await res.arrayBuffer();
+          const base64 =
+            typeof Buffer !== 'undefined'
+              ? Buffer.from(arrayBuf).toString('base64')
+              : btoa(String.fromCharCode(...new Uint8Array(arrayBuf)));
+          const decoded = extractSamplesFromWavDataUrl(`data:audio/wav;base64,${base64}`, sampleRate);
+          if (decoded) clipSampleCache.set(clip.audioUrl, decoded);
+        }
+      }
+    } catch {
+      // Ignore network failures gracefully; will fall back to synthesis
+    }
+  }
+}
+
+/**
+ * Retrieves audio samples for a clip: uses real decoded audio from audioUrl if available,
+ * or falls back cleanly to procedural speech/instrument synthesis.
+ */
+export function getClipSamples(clip: TimelineClip, sampleRate: number): Float32Array {
+  if (clip.audioUrl) {
+    let decoded = clipSampleCache.get(clip.audioUrl);
+    if (!decoded && clip.audioUrl.startsWith('data:audio/')) {
+      decoded = extractSamplesFromWavDataUrl(clip.audioUrl, sampleRate) || undefined;
+    }
+    if (decoded && decoded.length > 0) {
+      const targetSamples = Math.floor(clip.duration * sampleRate);
+      const result = new Float32Array(targetSamples);
+
+      const trimStartSamples = Math.floor((clip.trimStart || 0) * sampleRate);
+
+      for (let i = 0; i < targetSamples; i++) {
+        const srcIndex = trimStartSamples + i;
+        if (srcIndex >= decoded.length) break;
+
+        let s = decoded[srcIndex];
+        const t = i / sampleRate;
+
+        // Apply fade in
+        if (clip.fadeIn > 0 && t < clip.fadeIn) {
+          s *= t / clip.fadeIn;
+        }
+        // Apply fade out
+        const timeRemaining = clip.duration - t;
+        if (clip.fadeOut > 0 && timeRemaining < clip.fadeOut) {
+          s *= Math.max(0, timeRemaining / clip.fadeOut);
+        }
+
+        result[i] = s * (clip.volume ?? 1.0);
+      }
+      return result;
+    }
+  }
+
+  // Fallback to procedural synthesis
+  return synthesizeClipSamples(clip, sampleRate);
+}
+
+/**
  * Procedural synthesizer for timeline clips when raw WAV data is unavailable
  */
 function synthesizeClipSamples(clip: TimelineClip, sampleRate: number): Float32Array {
@@ -216,7 +379,10 @@ export async function mixMultitrackTimeline(
   tracks: TimelineTrack[],
   clips: TimelineClip[],
   sampleRate: number = 24000
-): Promise<{ dataUrl: string; durationSeconds: number; sizeBytes: number }> {
+): Promise<{ dataUrl: string; durationSeconds: number; sizeBytes: number; rawBytes?: Uint8Array }> {
+  // Preload and decode any remote/uploaded audio streams
+  await preloadClipSamples(clips, sampleRate);
+
   const totalDuration = calculateTotalDuration(clips);
   const totalSamples = Math.floor(totalDuration * sampleRate);
 
@@ -235,7 +401,7 @@ export async function mixMultitrackTimeline(
     // Check mute & solo
     if (!isTrackAudible(track, tracks)) continue;
 
-    const clipSamples = synthesizeClipSamples(clip, sampleRate);
+    const clipSamples = getClipSamples(clip, sampleRate);
     const startSample = Math.floor(clip.startTime * sampleRate);
 
     // Calculate effective pan (-1.0 left to +1.0 right)
@@ -284,6 +450,7 @@ export async function mixMultitrackTimeline(
     dataUrl,
     durationSeconds: totalDuration,
     sizeBytes: wavBytes.byteLength,
+    rawBytes: wavBytes,
   };
 }
 

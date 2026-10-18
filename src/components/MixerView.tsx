@@ -1,10 +1,10 @@
 /**
- * VoxStory AI - Audio Mixer Console (v4.0)
- * Expansive digital audio workstation mixer for ambience blending,
+ * VoxStory AI - Audio Mixer Console (v12 Beta)
+ * Expansive digital audio workstation mixer for custom audio track upload,
  * voice-priority ducking, procedural soundscapes, and master export.
  */
 
-import React, { useState } from 'react';
+import React, { useState, useRef } from 'react';
 import {
   Music,
   Volume2,
@@ -21,8 +21,13 @@ import {
   Radio,
   FileAudio,
   ShieldCheck,
+  AlertCircle,
+  Loader2,
+  Edit2,
+  Check,
+  X,
 } from 'lucide-react';
-import { BackgroundTrackConfig, GenerationResult } from '../types';
+import { BackgroundTrackConfig, GenerationResult, AudioAsset } from '../types';
 import { BUILTIN_AMBIENT_PRESETS, generateProceduralAmbience, mixAudioTracks } from '../lib/audioMixer';
 
 interface MixerViewProps {
@@ -48,6 +53,17 @@ export const MixerView: React.FC<MixerViewProps> = ({
   const [previewAudio, setPreviewAudio] = useState<HTMLAudioElement | null>(null);
   const [isPlayingPreview, setIsPlayingPreview] = useState(false);
 
+  // Upload state
+  const [isUploading, setIsUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [uploadedAsset, setUploadedAsset] = useState<AudioAsset | null>(null);
+  const uploadControllerRef = useRef<AbortController | null>(null);
+
+  // Track name editing
+  const [isEditingTrackName, setIsEditingTrackName] = useState(false);
+  const [trackNameDraft, setTrackNameDraft] = useState('');
+
   const activeConfig: BackgroundTrackConfig = bgConfig || {
     id: 'bg-default',
     name: 'Cinematic Deep Drone',
@@ -63,27 +79,126 @@ export const MixerView: React.FC<MixerViewProps> = ({
 
   const handleSelectPreset = (presetId: string) => {
     setSelectedPreset(presetId);
+    setUploadError(null);
+    setUploadedAsset(null);
     const preset = BUILTIN_AMBIENT_PRESETS.find((p) => p.id === presetId);
     const ambient = generateProceduralAmbience(presetId, Math.max(15, currentTake?.durationSeconds || 20));
 
     onUpdateBgConfig({
       ...activeConfig,
+      id: `preset-${presetId}`,
       name: preset?.name || 'Ambient Ambience',
       audioUrl: ambient.dataUrl,
       duration: ambient.duration,
     });
   };
 
-  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    const url = URL.createObjectURL(file);
-    onUpdateBgConfig({
-      ...activeConfig,
-      name: file.name.replace(/\.[^/.]+$/, ''),
-      audioUrl: url,
-    });
+    setUploadError(null);
+
+    // Client-side quick checks
+    if (file.size === 0) {
+      setUploadError('Selected file is empty (0 bytes).');
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setUploadError(`File is too large: ${(file.size / (1024 * 1024)).toFixed(1)}MB exceeds the 15MB limit.`);
+      return;
+    }
+
+    const controller = new AbortController();
+    uploadControllerRef.current = controller;
+    setIsUploading(true);
+    setUploadProgress(15);
+
+    try {
+      const reader = new FileReader();
+      reader.onerror = () => {
+        setUploadError('Failed to read local file.');
+        setIsUploading(false);
+      };
+
+      reader.onload = async () => {
+        setUploadProgress(40);
+        const dataUrl = reader.result as string;
+
+        try {
+          const resp = await fetch('/api/audio/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              filename: file.name,
+              dataUrl,
+              trackType: 'ambience',
+              projectId: currentTake?.projectId,
+            }),
+            signal: controller.signal,
+          });
+
+          setUploadProgress(80);
+
+          const result = await resp.json();
+          if (!resp.ok || !result.success) {
+            const errDetail = result.details ? `: ${result.details.join(', ')}` : '';
+            throw new Error((result.error || 'Audio upload failed') + errDetail);
+          }
+
+          const asset: AudioAsset = result.data;
+          setUploadedAsset(asset);
+          setUploadProgress(100);
+
+          onUpdateBgConfig({
+            ...activeConfig,
+            id: asset.id,
+            name: asset.filename.replace(/\.[^/.]+$/, ''),
+            audioUrl: asset.url,
+            duration: asset.durationSeconds,
+          });
+
+          setTimeout(() => {
+            setIsUploading(false);
+            setUploadProgress(0);
+          }, 500);
+        } catch (err: unknown) {
+          if (controller.signal.aborted) {
+            setUploadError('Audio upload was cancelled.');
+          } else {
+            setUploadError(err instanceof Error ? err.message : String(err));
+          }
+          setIsUploading(false);
+          setUploadProgress(0);
+        }
+      };
+
+      reader.readAsDataURL(file);
+    } catch (err) {
+      setUploadError(err instanceof Error ? err.message : String(err));
+      setIsUploading(false);
+      setUploadProgress(0);
+    }
+  };
+
+  const handleCancelUpload = () => {
+    if (uploadControllerRef.current) {
+      uploadControllerRef.current.abort();
+      uploadControllerRef.current = null;
+    }
+    setIsUploading(false);
+    setUploadProgress(0);
+    setUploadError('Upload cancelled.');
+  };
+
+  const handleSaveTrackName = () => {
+    if (trackNameDraft.trim()) {
+      onUpdateBgConfig({
+        ...activeConfig,
+        name: trackNameDraft.trim(),
+      });
+    }
+    setIsEditingTrackName(false);
   };
 
   const togglePreview = () => {
@@ -132,14 +247,16 @@ export const MixerView: React.FC<MixerViewProps> = ({
       const mixedTake: GenerationResult = {
         ...currentTake,
         id: `take-mixed-${Date.now()}`,
-        title: `${currentTake.title} (Mixed Master)`,
+        title: `${currentTake.title} (Master Mix)`,
         audioUrl: mixed.dataUrl,
         durationSeconds: mixed.durationSeconds,
+        fileSizeBytes: mixed.sizeBytes,
         createdAt: new Date().toISOString(),
       };
 
       onMixedTakeCreated(mixedTake);
-      setMixStatus(`Master mix rendered successfully (${mixed.durationSeconds.toFixed(1)}s, 2ch 24kHz).`);
+      setMixStatus(`Master mix rendered successfully (${mixed.durationSeconds.toFixed(1)}s, 24kHz WAV).`);
+      setTimeout(() => setMixStatus(null), 5000);
     } catch (err) {
       setMixStatus(`Mixing error: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -241,20 +358,81 @@ export const MixerView: React.FC<MixerViewProps> = ({
             </div>
 
             {/* Custom Track Upload */}
-            <div className="pt-3 border-t border-[#1C1F2E]">
-              <label className="text-[11px] font-semibold text-[#8E92A8] block mb-2">
-                Or Upload Custom Ambient / Music File:
+            <div className="pt-3 border-t border-[#1C1F2E] space-y-3">
+              <label className="text-[11px] font-semibold text-[#8E92A8] block">
+                Or Import Audio File (WAV):
               </label>
+
               <label className="flex items-center justify-center gap-2 p-3 rounded-lg border border-dashed border-[#24283C] bg-[#141622] hover:bg-[#181B2A] cursor-pointer transition-colors text-xs text-[#8E92A8] hover:text-white">
                 <Upload className="w-4 h-4 text-violet-400" />
-                <span>Choose WAV / MP3 Audio File</span>
+                <span>Choose WAV Audio File</span>
                 <input
                   type="file"
-                  accept="audio/*"
+                  accept=".wav,audio/wav,audio/wave"
                   onChange={handleFileUpload}
+                  disabled={isUploading}
                   className="hidden"
                 />
               </label>
+
+              {/* Progress Bar */}
+              {isUploading && (
+                <div className="space-y-1.5 pt-1">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-violet-300 flex items-center gap-1.5">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      Uploading & validating... {uploadProgress}%
+                    </span>
+                    <button
+                      onClick={handleCancelUpload}
+                      className="text-[11px] text-red-400 hover:text-red-300 font-medium"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                  <div className="h-1.5 w-full bg-[#1C1F2E] rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-violet-500 rounded-full transition-all duration-300"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* Upload Error Banner */}
+              {uploadError && (
+                <div className="p-2.5 rounded-lg bg-red-950/40 border border-red-500/40 flex items-center justify-between gap-2 text-xs text-red-300">
+                  <div className="flex items-center gap-1.5">
+                    <AlertCircle className="w-4 h-4 text-red-400 shrink-0" />
+                    <span>{uploadError}</span>
+                  </div>
+                  <button onClick={() => setUploadError(null)} className="text-red-400 hover:text-white">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {/* Uploaded Track Metadata Badge */}
+              {uploadedAsset && (
+                <div className="p-2.5 rounded-lg bg-violet-950/20 border border-violet-500/30 flex items-center justify-between gap-2 text-xs">
+                  <div className="flex items-center gap-2">
+                    <FileAudio className="w-4 h-4 text-violet-400 shrink-0" />
+                    <div>
+                      <span className="font-semibold text-white">{uploadedAsset.filename}</span>
+                      <div className="flex items-center gap-2 text-[10px] text-violet-300/80 font-mono mt-0.5">
+                        <span>{uploadedAsset.sampleRate} Hz</span>
+                        <span>•</span>
+                        <span>{uploadedAsset.channels === 1 ? 'Mono' : 'Stereo'}</span>
+                        <span>•</span>
+                        <span>{uploadedAsset.durationSeconds.toFixed(1)}s</span>
+                      </div>
+                    </div>
+                  </div>
+                  <span className="text-[10px] px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-300 font-semibold border border-emerald-500/30">
+                    Imported
+                  </span>
+                </div>
+              )}
             </div>
           </div>
         </div>
@@ -267,28 +445,70 @@ export const MixerView: React.FC<MixerViewProps> = ({
                 <h3 className="text-xs font-bold uppercase tracking-wider text-white">
                   Mixer Channels & Dynamics
                 </h3>
-                <p className="text-[11px] text-[#7E8299] mt-0.5">
-                  Track: <span className="text-white font-medium">{activeConfig.name}</span>
-                </p>
+                {isEditingTrackName ? (
+                  <div className="flex items-center gap-1.5 mt-1">
+                    <input
+                      type="text"
+                      value={trackNameDraft}
+                      onChange={(e) => setTrackNameDraft(e.target.value)}
+                      className="h-6 px-2 text-xs rounded bg-[#181B28] border border-violet-500 text-white font-medium focus:outline-none"
+                      autoFocus
+                    />
+                    <button
+                      onClick={handleSaveTrackName}
+                      className="p-1 rounded bg-violet-600 text-white hover:bg-violet-500"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                ) : (
+                  <p className="text-[11px] text-[#7E8299] mt-0.5 flex items-center gap-1.5">
+                    Track: <span className="text-white font-medium">{activeConfig.name}</span>
+                    <button
+                      onClick={() => {
+                        setTrackNameDraft(activeConfig.name);
+                        setIsEditingTrackName(true);
+                      }}
+                      className="text-[#7E8299] hover:text-white"
+                      title="Rename track"
+                    >
+                      <Edit2 className="w-3 h-3" />
+                    </button>
+                  </p>
+                )}
               </div>
 
               {/* Audition Preset */}
-              <button
-                onClick={togglePreview}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#181B28] hover:bg-[#202436] text-white border border-[#23273C] text-xs font-medium transition-colors"
-              >
-                {isPlayingPreview ? (
-                  <>
-                    <Pause className="w-3.5 h-3.5 text-violet-400" />
-                    <span>Stop Preview</span>
-                  </>
-                ) : (
-                  <>
-                    <Play className="w-3.5 h-3.5 text-violet-400" />
-                    <span>Audition Ambience</span>
-                  </>
-                )}
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => onUpdateBgConfig({ ...activeConfig, isMuted: !activeConfig.isMuted })}
+                  className={`p-1.5 rounded-lg border text-xs font-medium transition-colors ${
+                    activeConfig.isMuted
+                      ? 'bg-red-950/40 border-red-500/50 text-red-300'
+                      : 'bg-[#181B28] border-[#23273C] text-[#8E92A8] hover:text-white'
+                  }`}
+                  title={activeConfig.isMuted ? 'Unmute' : 'Mute'}
+                >
+                  {activeConfig.isMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
+                </button>
+
+                <button
+                  onClick={togglePreview}
+                  className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-[#181B28] hover:bg-[#202436] text-white border border-[#23273C] text-xs font-medium transition-colors"
+                >
+                  {isPlayingPreview ? (
+                    <>
+                      <Pause className="w-3.5 h-3.5 text-violet-400" />
+                      <span>Stop Audition</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play className="w-3.5 h-3.5 text-violet-400" />
+                      <span>Audition Audio</span>
+                    </>
+                  )}
+                </button>
+              </div>
             </div>
 
             {/* Track 1: Voice Narration (Static Master Level) */}
@@ -313,10 +533,10 @@ export const MixerView: React.FC<MixerViewProps> = ({
               <div className="flex items-center justify-between text-xs font-medium">
                 <div className="flex items-center gap-2">
                   <div className="w-2.5 h-2.5 rounded-full bg-indigo-400" />
-                  <span className="text-white">Channel 2: Ambience Volume</span>
+                  <span className="text-white">Channel 2: Background Volume</span>
                 </div>
                 <span className="font-mono text-indigo-300 tabular-nums">
-                  {Math.round(activeConfig.volume * 100)}%
+                  {activeConfig.isMuted ? 'Muted' : `${Math.round(activeConfig.volume * 100)}%`}
                 </span>
               </div>
               <input
@@ -348,10 +568,7 @@ export const MixerView: React.FC<MixerViewProps> = ({
                   step="0.5"
                   value={activeConfig.fadeInSeconds}
                   onChange={(e) =>
-                    onUpdateBgConfig({
-                      ...activeConfig,
-                      fadeInSeconds: parseFloat(e.target.value),
-                    })
+                    onUpdateBgConfig({ ...activeConfig, fadeInSeconds: parseFloat(e.target.value) })
                   }
                   className="w-full accent-violet-500 cursor-pointer h-1.5 bg-[#1C1F2E] rounded-lg"
                 />
@@ -371,10 +588,7 @@ export const MixerView: React.FC<MixerViewProps> = ({
                   step="0.5"
                   value={activeConfig.fadeOutSeconds}
                   onChange={(e) =>
-                    onUpdateBgConfig({
-                      ...activeConfig,
-                      fadeOutSeconds: parseFloat(e.target.value),
-                    })
+                    onUpdateBgConfig({ ...activeConfig, fadeOutSeconds: parseFloat(e.target.value) })
                   }
                   className="w-full accent-violet-500 cursor-pointer h-1.5 bg-[#1C1F2E] rounded-lg"
                 />
@@ -382,15 +596,15 @@ export const MixerView: React.FC<MixerViewProps> = ({
             </div>
 
             {/* Voice-Priority Ducking Section */}
-            <div className="p-4 rounded-lg bg-violet-950/20 border border-violet-500/30 space-y-3">
+            <div className="p-4 rounded-lg bg-[#141622] border border-[#1E2130] space-y-4">
               <div className="flex items-center justify-between">
                 <div>
-                  <h4 className="text-xs font-bold text-white flex items-center gap-1.5">
-                    <ShieldCheck className="w-4 h-4 text-violet-400" />
+                  <h4 className="text-xs font-semibold text-white flex items-center gap-1.5">
+                    <Radio className="w-3.5 h-3.5 text-violet-400" />
                     <span>Voice-Priority Automatic Ducking</span>
                   </h4>
-                  <p className="text-[11px] text-[#8E92A8] mt-0.5">
-                    Attenuates background volume by -10dB when speech is detected, smoothly rising during pauses
+                  <p className="text-[11px] text-[#7E8299] mt-0.5">
+                    Smoothly lowers background audio during narration
                   </p>
                 </div>
                 <input
@@ -404,21 +618,48 @@ export const MixerView: React.FC<MixerViewProps> = ({
               </div>
 
               {activeConfig.duckingEnabled && (
-                <div className="pt-2 border-t border-violet-500/20 flex items-center justify-between text-xs">
-                  <span className="text-[#8E92A8]">Ducking Attenuation Depth:</span>
-                  <span className="font-mono text-violet-300">
-                    -{(activeConfig.duckingAmount * 14).toFixed(0)} dB
-                  </span>
+                <div className="space-y-1.5 pt-2 border-t border-[#1C1F2E]">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-[#8E92A8]">Ducking Reduction Amount</span>
+                    <span className="font-mono text-violet-300 tabular-nums">
+                      -{Math.round(activeConfig.duckingAmount * 20)} dB ({Math.round(activeConfig.duckingAmount * 100)}%)
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.2"
+                    max="0.95"
+                    step="0.05"
+                    value={activeConfig.duckingAmount}
+                    onChange={(e) =>
+                      onUpdateBgConfig({ ...activeConfig, duckingAmount: parseFloat(e.target.value) })
+                    }
+                    className="w-full accent-violet-500 cursor-pointer h-1.5 bg-[#1C1F2E] rounded-lg"
+                  />
                 </div>
               )}
             </div>
 
-            {/* Status Message */}
-            {mixStatus && (
-              <div className="p-3 rounded-lg bg-violet-950/30 border border-violet-500/40 text-xs font-mono text-violet-200">
-                {mixStatus}
-              </div>
-            )}
+            {/* Remove Track Button */}
+            <div className="flex items-center justify-between pt-2">
+              <button
+                onClick={() => {
+                  if (previewAudio) previewAudio.pause();
+                  setUploadedAsset(null);
+                  onUpdateBgConfig(null);
+                }}
+                className="flex items-center gap-1.5 text-xs text-[#8E92A8] hover:text-red-400 transition-colors"
+              >
+                <Trash2 className="w-3.5 h-3.5" />
+                <span>Remove Background Track</span>
+              </button>
+
+              {mixStatus && (
+                <span className="text-xs font-mono text-violet-300">
+                  {mixStatus}
+                </span>
+              )}
+            </div>
           </div>
         </div>
       </div>

@@ -252,31 +252,31 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
     return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
   };
 
-  // Generation mode badge helper
+  // Generation mode badge helper (clean unboxed metadata)
   const renderModeBadge = (mode?: string, isDemo?: boolean) => {
     if (mode === 'live-provider') {
       return (
-        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-          Live Gnani Timbre
+        <span className="text-[11px] font-medium text-emerald-400 font-mono">
+          Live Timbre v3.0
         </span>
       );
     }
     if (mode === 'prerecorded-showcase') {
       return (
-        <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-300 border border-cyan-500/30">
+        <span className="text-[11px] font-medium text-cyan-400 font-mono">
           Showcase Track
         </span>
       );
     }
     return (
-      <span className="text-[10px] font-bold px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30">
-        Procedural Demo
+      <span className="text-[11px] font-medium text-amber-400 font-mono">
+        Studio Demo
       </span>
     );
   };
 
   return (
-    <div className="border-t border-[#1f2231] bg-[#0c0e15] px-4 lg:px-6 py-3 relative z-30">
+    <div className="border-t border-[#1F2231] bg-[#0C0E15] px-4 lg:px-6 py-3 relative z-30">
       {/* Hidden HTML audio element */}
       <audio
         ref={audioRef}
@@ -289,20 +289,21 @@ export const AudioPlayer: React.FC<AudioPlayerProps> = ({
       <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-center gap-3 md:gap-6 justify-between">
         {/* Left: Take Info & Mode Badge */}
         <div className="flex items-center gap-3 w-full md:w-72 truncate">
-          <div className="w-10 h-10 rounded-xl bg-[#161824] border border-[#262b3d] flex items-center justify-center shrink-0">
-            <FileAudio className="w-5 h-5 text-purple-400" />
+          <div className="w-10 h-10 rounded-xl bg-[#161824] border border-[#262B3D] flex items-center justify-center shrink-0">
+            <FileAudio className="w-5 h-5 text-violet-400" />
           </div>
 
           <div className="truncate flex-1">
             <h4 className="text-xs font-bold text-white truncate">
               {currentGeneration ? currentGeneration.title : 'No Audio Generated Yet'}
             </h4>
-            <div className="flex items-center gap-1.5 text-[11px] text-[#8e92a8] mt-0.5 flex-wrap">
+            <div className="flex items-center gap-1.5 text-[11px] text-[#8E92A8] mt-0.5 flex-wrap">
               <span>{currentGeneration?.voice || 'Direct voice'}</span>
-              <span>•</span>
-              <span className="uppercase text-[10px] font-semibold px-1.5 py-0.2 rounded bg-[#1b1f30] text-purple-300">
+              <span aria-hidden="true">·</span>
+              <span className="uppercase text-[10px] font-mono text-violet-300">
                 {currentGeneration?.audioConfig?.container || 'WAV'}
               </span>
+              <span aria-hidden="true">·</span>
               {currentGeneration && renderModeBadge(currentGeneration.generationMode, currentGeneration.isDemo)}
             </div>
           </div>

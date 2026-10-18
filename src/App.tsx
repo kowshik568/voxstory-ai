@@ -1,9 +1,9 @@
 /**
- * VoxStory AI - Root Application Component (v4.0)
+ * VoxStory AI - Root Application Component (v13.0)
  * Precision AI Voice Production Studio Architecture
  * Supporting Gnani Timbre v3.0 with verified endpoints,
- * multi-character dialogue scenes, procedural ambience mixer,
- * frame-accurate subtitle cues, and workstation navigation.
+ * responsive navigation, hash routing with back/forward history support,
+ * favorites persistence, project CRUD, and generation history.
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -36,7 +36,7 @@ const INITIAL_PROJECTS: StudioProject[] = [
     id: 'proj-1',
     title: 'YouTube Tech Reveal Hook',
     script: `<excited> What if I told you that everything you knew about battery technology just became obsolete? <pauses> Last Tuesday, researchers quietly published a paper. <whispers> And the numbers they reported are almost impossible to believe.`,
-    voice: 'Aarav',
+    voice: 'Shivani',
     language: 'en-IN',
     mode: 'solo',
     audioConfig: { ...DEFAULT_AUDIO_CONFIG },
@@ -58,7 +58,7 @@ const INITIAL_PROJECTS: StudioProject[] = [
     id: 'proj-3',
     title: 'Operation Nightfall — Vault Infiltration',
     script: `<whispers> Status report. Have we bypassed their automated sentries yet? <pauses> Everyone fall back to extraction point Bravo!`,
-    voice: 'Nalini',
+    voice: 'Avinash',
     language: 'en-IN',
     mode: 'dialogue',
     audioConfig: { ...DEFAULT_AUDIO_CONFIG },
@@ -67,12 +67,54 @@ const INITIAL_PROJECTS: StudioProject[] = [
   },
 ];
 
+const VALID_VIEWS: StudioView[] = [
+  'studio',
+  'voices',
+  'favorites',
+  'dialogue',
+  'mixer',
+  'projects',
+  'history',
+  'exports',
+  'showcase',
+];
+
+function getViewFromHash(): StudioView {
+  if (typeof window === 'undefined') return 'studio';
+  const hash = window.location.hash.replace(/^#\/?/, '').toLowerCase() as StudioView;
+  return VALID_VIEWS.includes(hash) ? hash : 'studio';
+}
+
 export default function App() {
-  const [currentView, setCurrentView] = useState<StudioView>('studio');
+  const [currentView, setCurrentView] = useState<StudioView>(getViewFromHash);
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
+  const [isMobileNavOpen, setIsMobileNavOpen] = useState(false);
   const [projects, setProjects] = useState<StudioProject[]>(INITIAL_PROJECTS);
   const [activeProjectId, setActiveProjectId] = useState<string>('proj-1');
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'unsaved'>('saved');
+  const [favoritesCount, setFavoritesCount] = useState<number>(5);
+
+  // Sync hash routing on navigate
+  const handleViewChange = (view: StudioView) => {
+    setCurrentView(view);
+    if (typeof window !== 'undefined') {
+      window.location.hash = `#${view}`;
+    }
+    if (view === 'dialogue') {
+      const dialogueProj = projects.find((p) => p.mode === 'dialogue');
+      if (dialogueProj) setActiveProjectId(dialogueProj.id);
+    }
+  };
+
+  // Browser back/forward navigation support
+  useEffect(() => {
+    const handleHashChange = () => {
+      const target = getViewFromHash();
+      setCurrentView(target);
+    };
+    window.addEventListener('hashchange', handleHashChange);
+    return () => window.removeEventListener('hashchange', handleHashChange);
+  }, []);
 
   // Active Project
   const activeProject =
@@ -87,6 +129,20 @@ export default function App() {
   // Background Ambience & Ducking
   const [bgConfig, setBgConfig] = useState<BackgroundTrackConfig | null>(null);
   const [mixedAudioUrl, setMixedAudioUrl] = useState<string | null>(null);
+
+  const handleUpdateBgConfig = (newBg: BackgroundTrackConfig | null) => {
+    setBgConfig(newBg);
+    if (activeProjectId) {
+      setProjects((prev) =>
+        prev.map((p) => (p.id === activeProjectId ? { ...p, backgroundTrack: newBg || undefined } : p))
+      );
+      fetch(`/api/projects/${activeProjectId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ backgroundTrack: newBg }),
+      }).catch(console.error);
+    }
+  };
 
   // Provider Health & Modals
   const [health, setHealth] = useState<ProviderHealth | null>(null);
@@ -118,10 +174,63 @@ export default function App() {
     }
   };
 
+  // Load favorites count
+  const loadFavoritesCount = async () => {
+    try {
+      const res = await fetch('/api/favorites');
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.data)) {
+          setFavoritesCount(json.data.length);
+        }
+      }
+    } catch {
+      // fallback
+    }
+  };
+
+  // Load persisted history from backend
+  const loadGenerations = async () => {
+    try {
+      const res = await fetch('/api/generations');
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.data) && json.data.length > 0) {
+          setGenerationHistory(json.data);
+          setCurrentGeneration(json.data[0]);
+        }
+      }
+    } catch (e) {
+      console.warn('Could not load generations from API:', e);
+    }
+  };
+
   useEffect(() => {
     checkHealth();
+    loadFavoritesCount();
 
-    // Initialize with a pre-rendered demo take so the audio player and waveforms are active
+    // Load persisted projects from server storage
+    const loadProjects = async () => {
+      try {
+        const res = await fetch('/api/projects');
+        if (res.ok) {
+          const json = await res.json();
+          if (Array.isArray(json.data) && json.data.length > 0) {
+            setProjects(json.data);
+            setActiveProjectId(json.data[0].id);
+            if (json.data[0].backgroundTrack) {
+              setBgConfig(json.data[0].backgroundTrack);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn('Could not load projects from API:', err);
+      }
+    };
+    loadProjects();
+    loadGenerations();
+
+    // Initialize initial sample take if none exists
     try {
       const demoWav = generateProceduralSpeechWav(
         '<whispers> The clock in the vestibule struck three. <pauses> Eleanor stepped past the torn velvet curtain. <sigh> There was no turning back now.',
@@ -147,7 +256,7 @@ export default function App() {
         fileSizeBytes: 142000,
       };
       setCurrentGeneration(initialTake);
-      setGenerationHistory([initialTake]);
+      setGenerationHistory((prev) => (prev.length === 0 ? [initialTake] : prev));
     } catch (e) {
       console.warn('Initial demo audio setup:', e);
     }
@@ -162,7 +271,7 @@ export default function App() {
         mode === 'solo'
           ? `<excited> Direct your scene with real vocal emotion! <pauses> Insert tags to control tone and pacing.`
           : `<whispers> Are we ready? <pauses> The broadcast starts in ten seconds.`,
-      voice: 'Nalini',
+      voice: 'Shivani',
       language: 'en-IN',
       mode,
       audioConfig: { ...DEFAULT_AUDIO_CONFIG },
@@ -172,16 +281,27 @@ export default function App() {
 
     setProjects([newProj, ...projects]);
     setActiveProjectId(newProj.id);
-    setCurrentView(mode === 'solo' ? 'studio' : 'dialogue');
+    handleViewChange(mode === 'solo' ? 'studio' : 'dialogue');
+
+    fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(newProj),
+    }).catch(console.error);
   };
 
   const handleSelectProject = (projectId: string) => {
     setActiveProjectId(projectId);
     const selected = projects.find((p) => p.id === projectId);
-    if (selected?.mode === 'dialogue') {
-      setCurrentView('dialogue');
+    if (selected?.backgroundTrack) {
+      setBgConfig(selected.backgroundTrack);
     } else {
-      setCurrentView('studio');
+      setBgConfig(null);
+    }
+    if (selected?.mode === 'dialogue') {
+      handleViewChange('dialogue');
+    } else {
+      handleViewChange('studio');
     }
   };
 
@@ -197,6 +317,12 @@ export default function App() {
     };
     setProjects([duplicated, ...projects]);
     setActiveProjectId(duplicated.id);
+
+    fetch('/api/projects', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(duplicated),
+    }).catch(console.error);
   };
 
   const handleDeleteProject = (projectId: string) => {
@@ -206,6 +332,8 @@ export default function App() {
     if (activeProjectId === projectId) {
       setActiveProjectId(remaining[0].id);
     }
+
+    fetch(`/api/projects/${projectId}`, { method: 'DELETE' }).catch(console.error);
   };
 
   const handleRenameProject = (projectId: string, newTitle: string) => {
@@ -214,6 +342,12 @@ export default function App() {
         p.id === projectId ? { ...p, title: newTitle, updatedAt: new Date().toISOString() } : p
       )
     );
+
+    fetch(`/api/projects/${projectId}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: newTitle }),
+    }).catch(console.error);
   };
 
   const handleUpdateActiveTitle = (newTitle: string) => {
@@ -297,11 +431,48 @@ export default function App() {
 
   // Voice Assignment from Catalog
   const handleSelectVoiceFromCatalog = (voiceName: string) => {
-    setProjects(
-      projects.map((p) =>
+    setProjects((prev) =>
+      prev.map((p) =>
         p.id === activeProjectId ? { ...p, voice: voiceName, updatedAt: new Date().toISOString() } : p
       )
     );
+    if (activeProjectId) {
+      fetch(`/api/projects/${activeProjectId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ voice: voiceName }),
+      }).catch(console.error);
+    }
+  };
+
+  // Open Take in Studio from History
+  const handleOpenTakeInStudio = (take: GenerationResult) => {
+    if (activeProjectId) {
+      setProjects((prev) =>
+        prev.map((p) =>
+          p.id === activeProjectId
+            ? {
+                ...p,
+                script: take.script,
+                voice: take.voice,
+                language: take.language,
+                updatedAt: new Date().toISOString(),
+              }
+            : p
+        )
+      );
+      fetch(`/api/projects/${activeProjectId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          script: take.script,
+          voice: take.voice,
+          language: take.language,
+        }),
+      }).catch(console.error);
+    }
+    setCurrentGeneration(take);
+    handleViewChange('studio');
   };
 
   return (
@@ -309,21 +480,18 @@ export default function App() {
       {/* 1. Left Navigation Sidebar */}
       <Sidebar
         currentView={currentView}
-        onViewChange={(view) => {
-          if (view === 'dialogue') {
-            const dialogueProj = projects.find((p) => p.mode === 'dialogue');
-            if (dialogueProj) setActiveProjectId(dialogueProj.id);
-          }
-          setCurrentView(view);
-        }}
+        onViewChange={handleViewChange}
         isCollapsed={isSidebarCollapsed}
         onToggleCollapse={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
         health={health}
         projectCount={projects.length}
         historyCount={generationHistory.length}
+        favoritesCount={favoritesCount}
         onNewProject={() => handleCreateNewProject('solo')}
         onOpenSettings={() => setIsSettingsOpen(true)}
         onOpenDocs={() => setIsDocsOpen(true)}
+        isMobileOpen={isMobileNavOpen}
+        onCloseMobile={() => setIsMobileNavOpen(false)}
       />
 
       {/* 2. Main Studio Column */}
@@ -335,15 +503,21 @@ export default function App() {
           onTitleChange={handleUpdateActiveTitle}
           saveStatus={saveStatus}
           health={health}
-          activeVoice={activeProject?.voice || 'Nalini'}
+          activeVoice={activeProject?.voice || 'Shivani'}
           activeLanguage={activeProject?.language || 'en-IN'}
           isGenerating={isGenerating}
           onGenerate={handleGlobalGenerate}
           isStreamingMode={isStreamingMode}
           onToggleStreamingMode={setIsStreamingMode}
-          onOpenExport={() => setCurrentView('exports')}
+          onOpenExport={() => handleViewChange('exports')}
           onOpenSettings={() => setIsSettingsOpen(true)}
           hasAudio={Boolean(currentGeneration)}
+          onToggleMobileMenu={() => setIsMobileNavOpen(!isMobileNavOpen)}
+          onSearch={(query) => {
+            if (query.trim()) {
+              handleViewChange('voices');
+            }
+          }}
         />
 
         {/* Dynamic Workspace View Area */}
@@ -364,8 +538,8 @@ export default function App() {
                 setGenerationHistory((prev) => [assembledTake, ...prev]);
               }}
               isGeneratingMaster={isGenerating}
-              onOpenMixer={() => setCurrentView('mixer')}
-              onOpenExport={() => setCurrentView('exports')}
+              onOpenMixer={() => handleViewChange('mixer')}
+              onOpenExport={() => handleViewChange('exports')}
               history={generationHistory}
               onSelectTake={setCurrentGeneration}
               mixedAudioUrl={mixedAudioUrl}
@@ -388,14 +562,14 @@ export default function App() {
             <MixerView
               currentTake={currentGeneration}
               bgConfig={bgConfig}
-              onUpdateBgConfig={setBgConfig}
+              onUpdateBgConfig={handleUpdateBgConfig}
               onMixedTakeCreated={(mixedTake) => {
                 setCurrentGeneration(mixedTake);
                 setGenerationHistory((prev) => [mixedTake, ...prev]);
                 setMixedAudioUrl(mixedTake.audioUrl);
               }}
               mixedAudioUrl={mixedAudioUrl}
-              onOpenStudio={() => setCurrentView('studio')}
+              onOpenStudio={() => handleViewChange('studio')}
             />
           )}
 
@@ -405,17 +579,33 @@ export default function App() {
               activeTake={currentGeneration}
               onSelectTake={setCurrentGeneration}
               onClearHistory={() => setGenerationHistory([])}
+              onOpenInStudio={handleOpenTakeInStudio}
+              onDeleteTake={(id) => {
+                setGenerationHistory((prev) => prev.filter((t) => t.id !== id));
+              }}
             />
           )}
 
           {currentView === 'voices' && (
             <VoicesView
-              activeVoice={activeProject?.voice || 'Nalini'}
+              activeVoice={activeProject?.voice || 'Shivani'}
               onSelectVoice={handleSelectVoiceFromCatalog}
               onOpenInStudio={(voiceName) => {
                 handleSelectVoiceFromCatalog(voiceName);
-                setCurrentView('studio');
+                handleViewChange('studio');
               }}
+            />
+          )}
+
+          {currentView === 'favorites' && (
+            <VoicesView
+              activeVoice={activeProject?.voice || 'Shivani'}
+              onSelectVoice={handleSelectVoiceFromCatalog}
+              onOpenInStudio={(voiceName) => {
+                handleSelectVoiceFromCatalog(voiceName);
+                handleViewChange('studio');
+              }}
+              initialShowFavoritesOnly={true}
             />
           )}
 
@@ -423,7 +613,7 @@ export default function App() {
             <ExportsView
               currentTake={currentGeneration}
               mixedAudioUrl={mixedAudioUrl}
-              onOpenStudio={() => setCurrentView('studio')}
+              onOpenStudio={() => handleViewChange('studio')}
             />
           )}
 
@@ -433,7 +623,7 @@ export default function App() {
                 if (template) {
                   setSelectedTemplateForStudio(template);
                 }
-                setCurrentView('studio');
+                handleViewChange('studio');
               }}
               onOpenDocs={() => setIsDocsOpen(true)}
             />

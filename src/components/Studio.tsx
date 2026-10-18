@@ -33,6 +33,7 @@ import { ExpressionPaletteModal } from './ExpressionPaletteModal';
 import { DialogueEditor } from './DialogueEditor';
 import { AudioMixerPanel } from './AudioMixerPanel';
 import { ExportModal } from './ExportModal';
+import { CharacterPanel, ProjectCharacter } from './CharacterPanel';
 import { TEMPLATES } from '../lib/templates';
 import { SUPPORTED_VOICES, DEFAULT_AUDIO_CONFIG } from '../lib/voices';
 import { validateScript } from '../lib/tagCatalog';
@@ -116,6 +117,14 @@ export const Studio: React.FC<StudioProps> = ({
   const [isExportOpen, setIsExportOpen] = useState(false);
   const [mixedAudioUrl, setMixedAudioUrl] = useState<string | null>(null);
 
+  // Cast & Character Management
+  const [characters, setCharacters] = useState<ProjectCharacter[]>([
+    { id: 'char-1', name: 'Nalini (Narrator)', voice: 'Nalini', role: 'Narrator', color: '#ec4899', speed: 1.0 },
+    { id: 'char-2', name: 'Rohan (Lead)', voice: 'Rohan', role: 'Protagonist', color: '#8b5cf6', speed: 1.0 },
+    { id: 'char-3', name: 'Aarav (Tech)', voice: 'Aarav', role: 'AI / Assistant', color: '#06b6d4', speed: 1.0 },
+  ]);
+  const [isCharacterPanelOpen, setIsCharacterPanelOpen] = useState(false);
+
   // Left sidebar tab: 'projects' | 'templates'
   const [sidebarTab, setSidebarTab] = useState<'projects' | 'templates'>('projects');
   // Mobile active pane: 'editor' | 'inspector' | 'sidebar'
@@ -128,6 +137,22 @@ export const Studio: React.FC<StudioProps> = ({
     }
   }, [initialTemplate]);
 
+  // Load persisted projects on mount
+  useEffect(() => {
+    fetch('/api/projects')
+      .then((r) => r.json())
+      .then((d) => {
+        if (d.success && Array.isArray(d.data) && d.data.length > 0) {
+          setProjects(d.data);
+          setActiveProjectId(d.data[0].id);
+          if (d.data[0].backgroundTrack) {
+            setBgConfig(d.data[0].backgroundTrack);
+          }
+        }
+      })
+      .catch(() => {});
+  }, []);
+
   // Sync state when active project changes
   useEffect(() => {
     if (activeProject) {
@@ -138,6 +163,11 @@ export const Studio: React.FC<StudioProps> = ({
       setAudioConfig(activeProject.audioConfig || { ...DEFAULT_AUDIO_CONFIG });
       if (activeProject.mode) {
         setStudioMode(activeProject.mode);
+      }
+      if (activeProject.backgroundTrack) {
+        setBgConfig(activeProject.backgroundTrack);
+      } else {
+        setBgConfig(null);
       }
     }
   }, [activeProjectId]);
@@ -561,6 +591,9 @@ export const Studio: React.FC<StudioProps> = ({
                 onOpenMixer={() => setIsMixerOpen(true)}
                 onOpenExport={() => setIsExportOpen(true)}
                 hasGeneration={Boolean(currentGeneration)}
+                characters={characters}
+                onOpenCharacterPanel={() => setIsCharacterPanelOpen(true)}
+                onSwitchToMultitrack={() => setStudioMode('dialogue')}
               />
             </div>
 
@@ -607,7 +640,19 @@ export const Studio: React.FC<StudioProps> = ({
         onClose={() => setIsMixerOpen(false)}
         currentTake={currentGeneration}
         bgConfig={bgConfig}
-        onUpdateBgConfig={setBgConfig}
+        onUpdateBgConfig={(cfg) => {
+          setBgConfig(cfg);
+          if (activeProjectId) {
+            setProjects((prev) =>
+              prev.map((p) => (p.id === activeProjectId ? { ...p, backgroundTrack: cfg || undefined } : p))
+            );
+            fetch(`/api/projects/${activeProjectId}`, {
+              method: 'PATCH',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ backgroundTrack: cfg }),
+            }).catch(console.error);
+          }
+        }}
         onMixedTakeCreated={(take) => {
           setCurrentGeneration(take);
           setGenerationHistory([take, ...generationHistory]);
@@ -621,6 +666,20 @@ export const Studio: React.FC<StudioProps> = ({
         onClose={() => setIsExportOpen(false)}
         currentTake={currentGeneration}
         mixedAudioUrl={mixedAudioUrl}
+      />
+
+      {/* Voice Direction & Character Management Panel */}
+      <CharacterPanel
+        isOpen={isCharacterPanelOpen}
+        onClose={() => setIsCharacterPanelOpen(false)}
+        characters={characters}
+        onUpdateCharacters={(updated) => {
+          setCharacters(updated);
+          // If first character's voice changed, update active voice too
+          if (updated[0] && updated[0].voice !== voice) {
+            setVoice(updated[0].voice);
+          }
+        }}
       />
     </div>
   );

@@ -162,7 +162,29 @@ export interface GenerationResult {
   generationMode: GenerationMode;
   isDemo: boolean;
   fileSizeBytes: number;
+  providerRequestId?: string;
   waveform?: WaveformData;
+  userId?: string;
+  workspaceId?: string;
+}
+
+export interface AudioAsset {
+  id: string;
+  projectId?: string;
+  filename: string;
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  durationSeconds: number;
+  sampleRate: number;
+  channels: number;
+  bitDepth: number;
+  storageKey: string;
+  url: string;
+  trackType?: 'music' | 'ambience' | 'sfx' | 'speaker';
+  createdAt: string;
+  userId?: string;
+  workspaceId?: string;
 }
 
 export interface StudioProject {
@@ -177,6 +199,11 @@ export interface StudioProject {
   updatedAt: string;
   createdAt: string;
   lastGeneration?: GenerationResult;
+  backgroundTrack?: BackgroundTrackConfig;
+  timelineState?: MultitrackTimelineState;
+  audioAssets?: AudioAsset[];
+  userId?: string;
+  workspaceId?: string;
 }
 
 export interface BackgroundTrackConfig {

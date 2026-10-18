@@ -5,11 +5,14 @@
  */
 
 import { Router, Request, Response } from 'express';
+import fs from 'fs';
+import path from 'path';
 import { GnaniTimbreProvider, GenerationRequestSchema, GnaniProviderError } from './gnaniProvider';
 import { VERIFIED_TAGS, validateScript } from '../lib/tagCatalog';
 import { SUPPORTED_VOICES, SUPPORTED_LANGUAGES } from '../lib/voices';
 import { TEMPLATES } from '../lib/templates';
 import { validateWavBuffer, validateWavDataUrl } from '../lib/audioValidator';
+import { extractPcmFromWav } from '../lib/audioStitcher';
 import {
   StudioProject,
   GenerationResult,
@@ -17,12 +20,62 @@ import {
   GenerationJob,
   SystemMetrics,
   UserWorkspace,
+  AudioAsset,
 } from '../types';
+import { storage, audioStorage } from './storage/storageManager';
+import { migrateStorage } from './storage/migrator';
+import { generalRateLimiter, generationRateLimiter } from './rateLimiter';
+import {
+  getUserContext,
+  requireAuthMiddleware,
+  checkProjectOwnership,
+  checkAssetOwnership,
+} from './auth';
+
+const DATA_DIR = path.resolve(process.cwd(), '.data');
+const DATA_FILE = path.join(DATA_DIR, 'voxstory_store.json');
+
+function loadPersistedData(): {
+  projects?: StudioProject[];
+  generations?: GenerationResult[];
+} | null {
+  try {
+    if (fs.existsSync(DATA_FILE)) {
+      const raw = fs.readFileSync(DATA_FILE, 'utf-8');
+      return JSON.parse(raw);
+    }
+  } catch (e) {
+    console.warn('[VoxStory Persistence] Could not read disk store:', e);
+  }
+  return null;
+}
+
+function savePersistedData(projects: StudioProject[], generations: GenerationResult[]) {
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+    const safeGenerations = generations.slice(-50);
+    const content = JSON.stringify({ projects, generations: safeGenerations }, null, 2);
+    // Atomic write to prevent file corruption
+    const tmp = `${DATA_FILE}.${Date.now()}.tmp`;
+    fs.writeFileSync(tmp, content, 'utf-8');
+    fs.renameSync(tmp, DATA_FILE);
+  } catch (e) {
+    console.warn('[VoxStory Persistence] Could not write disk store:', e);
+  }
+}
 
 export function createApiRouter(): Router {
   const router = Router();
+  router.use(generalRateLimiter);
+  router.use(requireAuthMiddleware);
   const provider = new GnaniTimbreProvider();
+  storage.init().catch(console.error);
   const startTime = Date.now();
+
+  // Load from disk if available
+  const persisted = loadPersistedData();
 
   // Metrics Counters
   let totalRequests = 0;
@@ -30,16 +83,20 @@ export function createApiRouter(): Router {
   let failedGenerations = 0;
   let totalLatencyMs = 0;
   let totalAudioSecondsGenerated = 0;
+  let totalCharactersProcessed = 0;
 
-  // In-memory persistent project store (synced across sessions)
-  const projectsStore = new Map<string, StudioProject>([
+  // Persisted Favorites Store
+  const favoritesStore = new Set<string>(['shivani', 'avinash', 'nalini', 'lakshmi', 'kalpana']);
+
+  // Initialize projects store
+  const defaultProjects: [string, StudioProject][] = [
     [
       'demo-project-1',
       {
         id: 'demo-project-1',
         title: 'YouTube Tech Reveal Hook',
         script: `<excited> What if I told you that everything you knew about battery technology just became obsolete? <pauses> Last Tuesday, researchers quietly published a paper. <whispers> And the numbers they reported are almost impossible to believe.`,
-        voice: 'Nalini',
+        voice: 'Shivani',
         language: 'en-IN',
         audioConfig: {
           container: 'wav',
@@ -57,7 +114,7 @@ export function createApiRouter(): Router {
         id: 'demo-project-2',
         title: 'Midnight Chronicles Trailer',
         script: `<sigh> It is midnight across the subcontinent. <pauses> You’re listening to Midnight Chronicles. <whispers> Tonight, we unlock the forgotten telegrams. <slow> Pour yourself a warm cup, and let’s dive into the dark.`,
-        voice: 'Deepak',
+        voice: 'Avinash',
         language: 'en-IN',
         audioConfig: {
           container: 'wav',
@@ -69,11 +126,24 @@ export function createApiRouter(): Router {
         updatedAt: new Date().toISOString(),
       },
     ],
-  ]);
+  ];
+
+  const projectsStore = new Map<string, StudioProject>(
+    persisted?.projects && persisted.projects.length > 0
+      ? persisted.projects.map((p) => [p.id, p])
+      : defaultProjects
+  );
 
   // Generation takes history store
-  const generationsStore = new Map<string, GenerationResult>();
+  const generationsStore = new Map<string, GenerationResult>(
+    persisted?.generations && persisted.generations.length > 0
+      ? persisted.generations.map((g) => [g.id, g])
+      : []
+  );
 
+  const persistCurrentState = () => {
+    savePersistedData(Array.from(projectsStore.values()), Array.from(generationsStore.values()));
+  };
   // Asynchronous persistent jobs store & idempotency map
   const jobsStore = new Map<string, GenerationJob>();
   const idempotencyMap = new Map<string, string>(); // idempotencyKey -> jobId
@@ -116,6 +186,7 @@ export function createApiRouter(): Router {
         totalAudioSecondsGenerated += result.durationSeconds;
 
         generationsStore.set(result.id, result);
+        persistCurrentState();
         return result;
       } catch (err: unknown) {
         failedGenerations += 1;
@@ -210,21 +281,109 @@ export function createApiRouter(): Router {
     successfulGenerations += 1;
     totalLatencyMs += latency;
     totalAudioSecondsGenerated += result.durationSeconds;
+    totalCharactersProcessed += script.length;
 
     generationsStore.set(result.id, result);
+    persistCurrentState();
+    storage.saveGeneration(result).catch((err) => {
+      console.warn('[Storage] Background save generation failed:', err);
+    });
     return result;
   }
 
-  // 1. Health check & provider status
-  const handleHealth = (_req: Request, res: Response) => {
-    const health = provider.getHealth();
-    res.json({
-      success: true,
-      data: health,
-    });
+  // 1. Health & Liveness check (Fast, bounded, consumes zero Gnani credits)
+  const handleHealth = async (_req: Request, res: Response) => {
+    try {
+      const providerHealth = provider.getHealth();
+      const storageHealth = await storage.getHealth();
+      const durableRequired = process.env.STORAGE_REQUIRE_DURABLE === 'true';
+
+      return res.json({
+        success: true,
+        status: 'online',
+        version: '12.0.0',
+        uptimeSeconds: Math.floor((Date.now() - startTime) / 1000),
+        storage: {
+          driver: storageHealth.driver,
+          status: storageHealth.status,
+          isDurable: storageHealth.isDurable,
+          durableRequired,
+        },
+        data: providerHealth,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        status: 'degraded',
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
   };
   router.get('/health', handleHealth);
   router.get('/status', handleHealth);
+
+  // Readiness Check: Verifies critical storage readiness without calling external billable APIs
+  router.get('/ready', async (_req: Request, res: Response) => {
+    try {
+      const storageHealth = await storage.getHealth();
+      const durableRequired = process.env.STORAGE_REQUIRE_DURABLE === 'true';
+
+      if (durableRequired && (storageHealth.status === 'unavailable' || !storageHealth.isDurable)) {
+        return res.status(503).json({
+          success: false,
+          ready: false,
+          error: 'Durable cloud persistence is required (STORAGE_REQUIRE_DURABLE=true), but durable adapter is unavailable.',
+          storage: storageHealth,
+        });
+      }
+
+      return res.json({
+        success: true,
+        ready: true,
+        storage: storageHealth,
+      });
+    } catch (err) {
+      return res.status(503).json({
+        success: false,
+        ready: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Safe Provider Connection Diagnostic (Redacts keys, verifies live status)
+  router.get('/provider/diagnostic', async (_req: Request, res: Response) => {
+    try {
+      const diag = await provider.diagnoseConnection();
+      res.json({
+        success: true,
+        data: diag,
+      });
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Storage Durability & Disk Persistence Diagnostics
+  const handleStorageHealth = async (_req: Request, res: Response) => {
+    try {
+      const storageHealth = await storage.getHealth();
+      res.json({
+        success: true,
+        data: storageHealth,
+      });
+    } catch (err) {
+      res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  };
+  router.get('/storage/health', handleStorageHealth);
+  router.get('/storage/status', handleStorageHealth);
 
   // 2. Production Metrics & Structured Logs
   router.get('/metrics', (_req: Request, res: Response) => {
@@ -307,7 +466,7 @@ export function createApiRouter(): Router {
   router.post('/validate', handleScriptValidation);
 
   // 8. Synchronous Speech Generation (Legacy & Fast UI CTA)
-  router.post('/generations', async (req: Request, res: Response) => {
+  router.post('/generations', generationRateLimiter, async (req: Request, res: Response) => {
     const parsed = GenerationRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -344,7 +503,7 @@ export function createApiRouter(): Router {
 
   // 9. Persistent Generation Job System
   // Queue a new synthesis job with unique ID & duplicate-submission protection
-  router.post('/jobs', async (req: Request, res: Response) => {
+  router.post('/jobs', generationRateLimiter, async (req: Request, res: Response) => {
     const parsed = GenerationRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -500,7 +659,7 @@ export function createApiRouter(): Router {
   router.delete('/jobs/:id', handleCancelJob);
 
   // 10. Server-Sent Events (SSE) Streaming Speech Generation
-  router.post('/generations/stream', async (req: Request, res: Response) => {
+  router.post('/generations/stream', generationRateLimiter, async (req: Request, res: Response) => {
     const parsed = GenerationRequestSchema.safeParse(req.body);
     if (!parsed.success) {
       return res.status(400).json({
@@ -681,7 +840,7 @@ export function createApiRouter(): Router {
   });
 
   // 11. Multi-Character Dialogue Assembly Endpoint
-  router.post('/dialogue/assemble', async (req: Request, res: Response) => {
+  router.post('/dialogue/assemble', generationRateLimiter, async (req: Request, res: Response) => {
     const title = req.body.title || req.body.scene?.title || 'Dialogue Scene';
     const language = req.body.language || req.body.scene?.language || 'en-IN';
     const segments = req.body.segments || req.body.scene?.segments;
@@ -784,9 +943,10 @@ export function createApiRouter(): Router {
         } else {
           const base64Data = segAudioUrl.split(',')[1];
           const rawWav = Buffer.from(base64Data, 'base64');
-          const pcmOnly = rawWav.subarray(44);
-          pcmBuffers.push(pcmOnly);
-          totalPcmBytes += pcmOnly.length;
+          const { pcm } = extractPcmFromWav(new Uint8Array(rawWav));
+          const pcmBuf = Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+          pcmBuffers.push(pcmBuf);
+          totalPcmBytes += pcmBuf.length;
         }
 
         if (i < segments.length - 1) {
@@ -911,7 +1071,9 @@ export function createApiRouter(): Router {
     const { dataUrl, audioBase64 } = req.body;
     let url = dataUrl;
     if (!url && audioBase64) {
-      url = `data:audio/wav;base64,${audioBase64}`;
+      url = typeof audioBase64 === 'string' && audioBase64.startsWith('data:')
+        ? audioBase64
+        : `data:audio/wav;base64,${audioBase64}`;
     }
 
     if (!url || typeof url !== 'string') {
@@ -945,7 +1107,37 @@ export function createApiRouter(): Router {
     });
   });
 
-  // 15. Get generation by id
+  // 15a. List generation history (with pagination & search)
+  router.get('/generations', async (req: Request, res: Response) => {
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string, 10) || 50));
+    const offset = Math.max(0, parseInt(req.query.offset as string, 10) || 0);
+    const voiceFilter = req.query.voice as string | undefined;
+    const search = req.query.search as string | undefined;
+
+    let list = Array.from(generationsStore.values()).sort(
+      (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()
+    );
+
+    if (voiceFilter) {
+      list = list.filter((g) => g.voice.toLowerCase() === voiceFilter.toLowerCase());
+    }
+    if (search) {
+      const q = search.toLowerCase();
+      list = list.filter((g) => g.title.toLowerCase().includes(q) || g.script.toLowerCase().includes(q));
+    }
+
+    const total = list.length;
+    const paginated = list.slice(offset, offset + limit);
+
+    return res.json({
+      success: true,
+      count: paginated.length,
+      total,
+      data: paginated,
+    });
+  });
+
+  // 15b. Get generation by id
   router.get('/generations/:id', (req: Request, res: Response) => {
     const generation = generationsStore.get(req.params.id);
     if (!generation) {
@@ -960,11 +1152,90 @@ export function createApiRouter(): Router {
     });
   });
 
-  // 16. Projects CRUD
-  router.get('/projects', (_req: Request, res: Response) => {
-    const list = Array.from(projectsStore.values()).sort(
-      (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime()
-    );
+  // 15c. Delete generation by id
+  router.delete('/generations/:id', async (req: Request, res: Response) => {
+    const id = req.params.id;
+    const existed = generationsStore.delete(id);
+    if (existed) {
+      persistCurrentState();
+      await storage.deleteGeneration(id).catch(console.error);
+    }
+    return res.json({
+      success: true,
+      deleted: existed,
+      id,
+    });
+  });
+
+  // 15d. Clear all generations
+  router.delete('/generations', async (_req: Request, res: Response) => {
+    const count = generationsStore.size;
+    generationsStore.clear();
+    persistCurrentState();
+    return res.json({
+      success: true,
+      cleared: count,
+    });
+  });
+
+  // 15e. Favorites CRUD
+  router.get('/favorites', (_req: Request, res: Response) => {
+    return res.json({
+      success: true,
+      count: favoritesStore.size,
+      data: Array.from(favoritesStore),
+    });
+  });
+
+  router.post('/favorites/:id', (req: Request, res: Response) => {
+    const voiceId = req.params.id.toLowerCase().trim();
+    favoritesStore.add(voiceId);
+    return res.json({
+      success: true,
+      data: Array.from(favoritesStore),
+    });
+  });
+
+  router.delete('/favorites/:id', (req: Request, res: Response) => {
+    const voiceId = req.params.id.toLowerCase().trim();
+    favoritesStore.delete(voiceId);
+    return res.json({
+      success: true,
+      data: Array.from(favoritesStore),
+    });
+  });
+
+  // 15f. Real Usage & Credit Accounting
+  router.get('/usage', (_req: Request, res: Response) => {
+    const pHealth = provider.getHealth();
+    return res.json({
+      success: true,
+      data: {
+        totalRequests,
+        successfulGenerations,
+        failedGenerations,
+        totalAudioSecondsGenerated: Math.round(totalAudioSecondsGenerated * 10) / 10,
+        totalCharactersProcessed,
+        activeJobs: jobsStore.size,
+        provider: {
+          status: pHealth.status,
+          model: pHealth.model,
+          hasApiKey: pHealth.hasApiKey,
+          apiEndpoint: pHealth.apiEndpoint,
+          streamingSupported: pHealth.streamingSupported,
+        },
+        creditAccountingNotice:
+          'Gnani Timbre v3.0 charges based on character volume and inference requests according to enterprise API quota. Consult provider console for exact balance ledger.',
+      },
+    });
+  });
+
+  // 16. Projects CRUD (with User & Workspace Isolation)
+  router.get('/projects', (req: Request, res: Response) => {
+    const user = getUserContext(req);
+    const list = Array.from(projectsStore.values())
+      .filter((p) => !p.userId || p.userId === user.userId || p.workspaceId === user.workspaceId)
+      .sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
     res.json({
       success: true,
       count: list.length,
@@ -972,7 +1243,34 @@ export function createApiRouter(): Router {
     });
   });
 
+  router.get('/projects/:id', async (req: Request, res: Response) => {
+    const user = getUserContext(req);
+    let project = projectsStore.get(req.params.id);
+    if (!project) {
+      project = (await storage.getProject(req.params.id)) || undefined;
+    }
+    if (!project) {
+      return res.status(404).json({
+        success: false,
+        error: `Project "${req.params.id}" not found`,
+      });
+    }
+    const ownership = checkProjectOwnership(project, user);
+    if (!ownership.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: ownership.reason || 'Forbidden: Access denied to project',
+        code: 'FORBIDDEN',
+      });
+    }
+    return res.json({
+      success: true,
+      data: project,
+    });
+  });
+
   router.post('/projects', (req: Request, res: Response) => {
+    const user = getUserContext(req);
     const { title, script, voice, language, audioConfig, mode } = req.body;
     if (!title || !script) {
       return res.status(400).json({
@@ -995,11 +1293,15 @@ export function createApiRouter(): Router {
         sampleRate: 24000,
         numChannels: 1,
       },
+      userId: user.userId,
+      workspaceId: user.workspaceId,
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
 
     projectsStore.set(id, newProject);
+    persistCurrentState();
+    storage.saveProject(newProject).catch(console.error);
     res.status(201).json({
       success: true,
       data: newProject,
@@ -1007,11 +1309,21 @@ export function createApiRouter(): Router {
   });
 
   router.patch('/projects/:id', (req: Request, res: Response) => {
+    const user = getUserContext(req);
     const existing = projectsStore.get(req.params.id);
     if (!existing) {
       return res.status(404).json({
         success: false,
         error: 'Project not found',
+      });
+    }
+
+    const ownership = checkProjectOwnership(existing, user);
+    if (!ownership.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: ownership.reason || 'Forbidden: Cannot modify project',
+        code: 'FORBIDDEN',
       });
     }
 
@@ -1023,6 +1335,8 @@ export function createApiRouter(): Router {
     };
 
     projectsStore.set(existing.id, updated);
+    persistCurrentState();
+    storage.saveProject(updated).catch(console.error);
     res.json({
       success: true,
       data: updated,
@@ -1030,17 +1344,306 @@ export function createApiRouter(): Router {
   });
 
   router.delete('/projects/:id', (req: Request, res: Response) => {
-    const deleted = projectsStore.delete(req.params.id);
-    if (!deleted) {
+    const user = getUserContext(req);
+    const existing = projectsStore.get(req.params.id);
+    if (!existing) {
       return res.status(404).json({
         success: false,
         error: 'Project not found',
       });
     }
+
+    const ownership = checkProjectOwnership(existing, user);
+    if (!ownership.allowed) {
+      return res.status(403).json({
+        success: false,
+        error: ownership.reason || 'Forbidden: Cannot delete project',
+        code: 'FORBIDDEN',
+      });
+    }
+
+    projectsStore.delete(req.params.id);
+    persistCurrentState();
+    storage.deleteProject(req.params.id).catch(console.error);
     res.json({
       success: true,
       message: 'Project deleted successfully',
     });
+  });
+
+  // 17. Background Audio Asset Upload & Streaming
+  router.post('/audio/upload', async (req: Request, res: Response) => {
+    try {
+      const MAX_UPLOAD_SIZE = 15 * 1024 * 1024; // 15MB limit
+      let rawBuffer: Buffer | null = null;
+      const filename = (req.body.filename || req.body.originalFilename || 'custom-audio.wav') as string;
+      const trackType = (req.body.trackType || 'ambience') as 'music' | 'ambience' | 'sfx' | 'speaker';
+      const projectId = req.body.projectId as string | undefined;
+
+      if (req.body.audioBase64) {
+        const cleanBase64 = req.body.audioBase64.replace(/^data:audio\/[a-z]+;base64,/, '');
+        rawBuffer = Buffer.from(cleanBase64, 'base64');
+      } else if (req.body.dataUrl) {
+        const parts = req.body.dataUrl.split('base64,');
+        if (parts.length > 1) {
+          rawBuffer = Buffer.from(parts[1], 'base64');
+        }
+      } else if (Buffer.isBuffer(req.body)) {
+        rawBuffer = req.body;
+      }
+
+      if (!rawBuffer || rawBuffer.length === 0) {
+        return res.status(400).json({
+          success: false,
+          error: 'Missing audio payload: upload must contain audioBase64, dataUrl, or binary audio data',
+        });
+      }
+
+      if (rawBuffer.length > MAX_UPLOAD_SIZE) {
+        return res.status(413).json({
+          success: false,
+          error: `Payload Too Large: Audio upload exceeds 15MB limit (received ${(rawBuffer.length / (1024 * 1024)).toFixed(2)} MB)`,
+        });
+      }
+
+      // Validate WAV header & PCM audio data
+      const wavCheck = validateWavBuffer(rawBuffer);
+      if (!wavCheck.isValid) {
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid or malformed WAV file',
+          details: wavCheck.errors,
+        });
+      }
+
+      // Sanitize filename against directory traversal and dangerous characters
+      const sanitizedBasename = path
+        .basename(filename)
+        .replace(/\.[^/.]+$/, '')
+        .replace(/[^a-zA-Z0-9_\-\s]/g, '')
+        .trim()
+        .substring(0, 80) || 'imported_audio';
+
+      const assetId = `asset-${Date.now()}-${Math.random().toString(36).substring(2, 8)}`;
+      const user = getUserContext(req);
+
+      // Store audio binary in audioStorage
+      await audioStorage.storeAudio(assetId, rawBuffer, 'audio/wav');
+
+      const asset: AudioAsset = {
+        id: assetId,
+        projectId,
+        filename: `${sanitizedBasename}.wav`,
+        originalFilename: filename,
+        mimeType: 'audio/wav',
+        sizeBytes: rawBuffer.length,
+        durationSeconds: wavCheck.durationSeconds,
+        sampleRate: wavCheck.sampleRate,
+        channels: wavCheck.numChannels,
+        bitDepth: wavCheck.bitsPerSample,
+        storageKey: assetId,
+        url: `/api/audio/assets/${assetId}/stream`,
+        trackType,
+        userId: user.userId,
+        workspaceId: user.workspaceId,
+        createdAt: new Date().toISOString(),
+      };
+
+      await storage.saveAudioAsset(asset);
+
+      // If projectId is associated, attach asset to project's audioAssets array
+      if (projectId && projectsStore.has(projectId)) {
+        const proj = projectsStore.get(projectId)!;
+        const currentAssets = proj.audioAssets || [];
+        proj.audioAssets = [...currentAssets, asset];
+        projectsStore.set(projectId, proj);
+        persistCurrentState();
+        storage.saveProject(proj).catch(console.error);
+      }
+
+      return res.status(201).json({
+        success: true,
+        data: asset,
+      });
+    } catch (err) {
+      console.error('[AudioUpload] Error processing upload:', err);
+      return res.status(500).json({
+        success: false,
+        error: 'Internal server error processing audio upload',
+      });
+    }
+  });
+
+  // List Audio Assets
+  router.get('/audio/assets', async (req: Request, res: Response) => {
+    try {
+      const user = getUserContext(req);
+      const projectId = req.query.projectId as string | undefined;
+      const allAssets = await storage.getAudioAssets(projectId);
+      const filtered = allAssets.filter((a) => !a.userId || a.userId === user.userId || a.workspaceId === user.workspaceId);
+      return res.json({
+        success: true,
+        count: filtered.length,
+        data: filtered,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Get Audio Asset Metadata
+  router.get('/audio/assets/:id', async (req: Request, res: Response) => {
+    try {
+      const user = getUserContext(req);
+      const asset = await storage.getAudioAsset(req.params.id);
+      if (!asset) {
+        return res.status(404).json({
+          success: false,
+          error: `Audio asset "${req.params.id}" not found`,
+        });
+      }
+      const ownership = checkAssetOwnership(asset, user);
+      if (!ownership.allowed) {
+        return res.status(403).json({
+          success: false,
+          error: ownership.reason || 'Forbidden: Access denied to audio asset',
+          code: 'FORBIDDEN',
+        });
+      }
+      return res.json({
+        success: true,
+        data: asset,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // Stream Audio Asset Binary
+  router.get('/audio/assets/:id/stream', async (req: Request, res: Response) => {
+    try {
+      const user = getUserContext(req);
+      const asset = await storage.getAudioAsset(req.params.id);
+      if (asset) {
+        const ownership = checkAssetOwnership(asset, user);
+        if (!ownership.allowed) {
+          return res.status(403).json({
+            success: false,
+            error: ownership.reason || 'Forbidden: Access denied to audio stream',
+            code: 'FORBIDDEN',
+          });
+        }
+      }
+      const binary = await audioStorage.getAudio(req.params.id);
+
+      if (!binary) {
+        return res.status(404).json({
+          success: false,
+          error: `Audio stream for asset "${req.params.id}" not found`,
+        });
+      }
+
+      const filename = asset?.filename || `${req.params.id}.wav`;
+      res.setHeader('Content-Type', binary.mimeType || 'audio/wav');
+      res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+      res.setHeader('Content-Length', binary.data.length.toString());
+      res.setHeader('ETag', `W/"asset-${req.params.id}"`);
+      res.setHeader('Cache-Control', 'public, max-age=3600');
+      if (asset) {
+        res.setHeader('X-Audio-SampleRate', asset.sampleRate.toString());
+        res.setHeader('X-Audio-Duration', asset.durationSeconds.toString());
+        res.setHeader('X-Audio-Channels', asset.channels.toString());
+      }
+
+      return res.end(binary.data);
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: `Failed to stream audio: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
+  });
+
+  // Delete Audio Asset
+  router.delete('/audio/assets/:id', async (req: Request, res: Response) => {
+    try {
+      const user = getUserContext(req);
+      const asset = await storage.getAudioAsset(req.params.id);
+      if (!asset) {
+        return res.status(404).json({
+          success: false,
+          error: `Audio asset "${req.params.id}" not found`,
+        });
+      }
+
+      const ownership = checkAssetOwnership(asset, user);
+      if (!ownership.allowed) {
+        return res.status(403).json({
+          success: false,
+          error: ownership.reason || 'Forbidden: Cannot delete audio asset',
+          code: 'FORBIDDEN',
+        });
+      }
+
+      // Protect against accidental deletion of referenced assets
+      const allProjects = await storage.getProjects();
+      const isReferenced = allProjects.some((p) => {
+        const hasInAssets = p.audioAssets?.some((a) => a.id === asset.id);
+        const hasInBg = p.backgroundTrack?.id === asset.id || p.backgroundTrack?.audioUrl?.includes(asset.id);
+        const hasInClips = p.timelineState?.clips?.some((c) => c.audioUrl?.includes(asset.id));
+        return hasInAssets || hasInBg || hasInClips;
+      });
+
+      if (isReferenced && req.query.force !== 'true') {
+        return res.status(409).json({
+          success: false,
+          error: `Cannot delete audio asset: it is currently referenced in an active project timeline or mixer track. Pass ?force=true to override.`,
+        });
+      }
+
+      await audioStorage.deleteAudio(req.params.id);
+      await storage.deleteAudioAsset(req.params.id);
+
+      return res.json({
+        success: true,
+        message: `Audio asset "${req.params.id}" deleted successfully`,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
+
+  // 18. Safe Legacy Storage Migration
+  router.post('/storage/migrate', async (req: Request, res: Response) => {
+    try {
+      const dryRun = req.body.dryRun ?? true;
+      const overwrite = req.body.overwrite ?? false;
+
+      const { FirestoreStorageAdapter } = await import('./storage/firestoreAdapter');
+      const target = new FirestoreStorageAdapter();
+      await target.init();
+
+      const report = await migrateStorage(storage, target, { dryRun, overwrite });
+
+      return res.json({
+        success: report.success,
+        data: report,
+      });
+    } catch (err) {
+      return res.status(500).json({
+        success: false,
+        error: `Migration failed: ${err instanceof Error ? err.message : String(err)}`,
+      });
+    }
   });
 
   return router;

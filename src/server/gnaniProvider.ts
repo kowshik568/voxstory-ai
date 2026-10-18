@@ -1,6 +1,6 @@
 /**
  * VoxStory AI - Gnani Timbre v3.0 Provider Adapter
- * Handles communication with Gnani Vachana / Timbre TTS API
+ * Handles live communication with Gnani Vachana / Timbre TTS API
  */
 
 import { z } from 'zod';
@@ -40,17 +40,95 @@ export class GnaniProviderError extends Error {
   }
 }
 
+/**
+ * 13 verified live voices supported directly by Gnani Timbre v3.0
+ */
+export const VERIFIED_TIMBRE_VOICES = [
+  'Avinash',
+  'Shivani',
+  'Lakshmi',
+  'Kalpana',
+  'Shubham',
+  'Prakash',
+  'Devansh',
+  'Yashraj',
+  'Chetana',
+  'Vasudha',
+  'Harshad',
+  'Riyaa',
+  'Tarika',
+] as const;
+
+/**
+ * Maps legacy or demo voice names to verified Timbre v3.0 voices
+ */
+export const VOICE_COMPAT_MAP: Record<string, string> = {
+  nalini: 'Shivani',
+  deepak: 'Avinash',
+  kaveri: 'Lakshmi',
+  aarav: 'Shubham',
+  ananya: 'Kalpana',
+  rohan: 'Yashraj',
+  priya: 'Chetana',
+  aditi: 'Vasudha',
+  suresh: 'Prakash',
+  meera: 'Tarika',
+  vikram: 'Harshad',
+  sneha: 'Riyaa',
+};
+
+export function resolveTimbreVoice(voiceInput: string): string {
+  const match = VERIFIED_TIMBRE_VOICES.find(
+    (v) => v.toLowerCase() === voiceInput.trim().toLowerCase()
+  );
+  if (match) return match;
+
+  const mapped = VOICE_COMPAT_MAP[voiceInput.trim().toLowerCase()];
+  if (mapped) return mapped;
+
+  return 'Shivani'; // Default expressive flagship voice
+}
+
+/**
+ * Extracts accurate duration from a binary WAV buffer
+ */
+export function getWavDurationFromBuffer(buffer: ArrayBuffer, fallbackSec: number): number {
+  if (buffer.byteLength < 44) return fallbackSec;
+  try {
+    const view = new DataView(buffer);
+    const sampleRate = view.getUint32(24, true);
+    const byteRate = view.getUint32(28, true);
+    const dataSize = view.getUint32(40, true);
+
+    const actualPcmSize =
+      dataSize > 0 && dataSize < buffer.byteLength ? dataSize : buffer.byteLength - 44;
+    const rate = byteRate > 0 ? byteRate : sampleRate > 0 ? sampleRate * 2 : 48000;
+    const dur = actualPcmSize / rate;
+
+    return dur > 0.1 && dur < 3600 ? Math.round(dur * 100) / 100 : fallbackSec;
+  } catch {
+    return fallbackSec;
+  }
+}
+
 export class GnaniTimbreProvider {
   private apiKey: string | null;
   private baseUrl: string;
 
   constructor(apiKey?: string, baseUrl = 'https://api.vachana.ai') {
-    this.apiKey = apiKey || process.env.GNANI_API_KEY || null;
+    this.apiKey =
+      typeof apiKey === 'string'
+        ? apiKey
+        : process.env.GNANI_API_KEY || process.env.GNANI_TOKEN || null;
     this.baseUrl = baseUrl;
   }
 
   hasApiKey(): boolean {
-    return Boolean(this.apiKey && this.apiKey.trim().length > 0 && !this.apiKey.includes('your_gnani_api_key'));
+    return Boolean(
+      this.apiKey &&
+        this.apiKey.trim().length > 0 &&
+        !this.apiKey.includes('your_gnani_api_key')
+    );
   }
 
   getHealth(): ProviderHealth {
@@ -65,6 +143,98 @@ export class GnaniTimbreProvider {
       streamingSupported: true,
       streamingEndpoint: `${this.baseUrl}/api/v1/tts/sse`,
     };
+  }
+
+  /**
+   * Safe connectivity diagnostic that verifies API connectivity and authentication
+   * without logging or exposing secrets.
+   */
+  async diagnoseConnection(): Promise<{
+    configured: boolean;
+    connectivity: 'connected' | 'unreachable';
+    authStatus: 'authenticated' | 'invalid_credentials' | 'not_configured';
+    model: string;
+    latencyMs: number;
+    supportedVoicesCount: number;
+    error?: string;
+  }> {
+    if (!this.hasApiKey()) {
+      return {
+        configured: false,
+        connectivity: 'connected',
+        authStatus: 'not_configured',
+        model: 'timbre-v3.0',
+        latencyMs: 0,
+        supportedVoicesCount: VERIFIED_TIMBRE_VOICES.length,
+      };
+    }
+
+    const start = Date.now();
+    try {
+      const response = await fetch(`${this.baseUrl}/api/v1/tts/inference`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-API-Key-ID': this.apiKey as string,
+          Accept: 'audio/wav, application/json',
+        },
+        body: JSON.stringify({
+          text: 'Ping.',
+          voice: 'Shivani',
+          language: 'en-IN',
+          model: 'timbre-v3.0',
+          audio_config: {
+            container: 'wav',
+            encoding: 'linear_pcm',
+            sample_rate: 24000,
+          },
+        }),
+      });
+
+      const latencyMs = Date.now() - start;
+
+      if (response.ok) {
+        return {
+          configured: true,
+          connectivity: 'connected',
+          authStatus: 'authenticated',
+          model: 'timbre-v3.0',
+          latencyMs,
+          supportedVoicesCount: VERIFIED_TIMBRE_VOICES.length,
+        };
+      } else if (response.status === 401 || response.status === 403) {
+        return {
+          configured: true,
+          connectivity: 'connected',
+          authStatus: 'invalid_credentials',
+          model: 'timbre-v3.0',
+          latencyMs,
+          supportedVoicesCount: VERIFIED_TIMBRE_VOICES.length,
+          error: 'Gnani API key rejected (401 Unauthorized)',
+        };
+      } else {
+        const text = await response.text();
+        return {
+          configured: true,
+          connectivity: 'connected',
+          authStatus: 'authenticated',
+          model: 'timbre-v3.0',
+          latencyMs,
+          supportedVoicesCount: VERIFIED_TIMBRE_VOICES.length,
+          error: `Provider HTTP status ${response.status}: ${text.slice(0, 100)}`,
+        };
+      }
+    } catch (err) {
+      return {
+        configured: true,
+        connectivity: 'unreachable',
+        authStatus: 'not_configured',
+        model: 'timbre-v3.0',
+        latencyMs: Date.now() - start,
+        supportedVoicesCount: VERIFIED_TIMBRE_VOICES.length,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   }
 
   /**
@@ -88,10 +258,13 @@ export class GnaniTimbreProvider {
       );
     }
 
+    const resolvedVoice = resolveTimbreVoice(request.voice);
+
     const payload = {
       text: request.script,
-      voice: request.voice,
+      voice: resolvedVoice,
       language: request.language,
+      model: 'timbre-v3.0',
       audio_config: {
         container: request.audioConfig.container,
         encoding: request.audioConfig.encoding === 'mp3' ? 'mp3' : 'linear_pcm',
@@ -110,7 +283,7 @@ export class GnaniTimbreProvider {
         headers: {
           'Content-Type': 'application/json',
           'X-API-Key-ID': this.apiKey as string,
-          'Accept': `audio/${request.audioConfig.container}, application/json`,
+          Accept: `audio/${request.audioConfig.container}, application/json`,
         },
         body: JSON.stringify(payload),
         signal: controller.signal,
@@ -150,31 +323,39 @@ export class GnaniTimbreProvider {
         }
       }
 
-      // Check content type
+      // Check content type & provider request tracking
       const contentType = response.headers.get('content-type') || '';
+      const providerRequestId = response.headers.get('x-api-request-id') || undefined;
       let audioBuffer: ArrayBuffer;
 
       if (contentType.includes('application/json')) {
         const json = await response.json();
         if (json.audioContent || json.audio_data || json.audio) {
           const base64Str = json.audioContent || json.audio_data || json.audio;
+          const rawBytes = Buffer.from(base64Str, 'base64');
+          const exactDuration = getWavDurationFromBuffer(
+            rawBytes.buffer,
+            validation.estimatedDurationSeconds
+          );
+
           return {
             id: `gen-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
             projectId: request.projectId,
             title: request.title || 'Live Timbre v3.0 Take',
             script: request.script,
-            voice: request.voice,
+            voice: resolvedVoice,
             language: request.language,
             audioConfig: request.audioConfig,
             audioUrl: `data:audio/${request.audioConfig.container};base64,${base64Str}`,
-            durationSeconds: validation.estimatedDurationSeconds,
+            durationSeconds: exactDuration,
             wordCount: validation.wordCount,
             detectedTags: validation.detectedTags,
             createdAt: new Date().toISOString(),
             provider: 'gnani-timbre-v3',
             generationMode: 'live-provider',
             isDemo: false,
-            fileSizeBytes: Buffer.from(base64Str, 'base64').byteLength,
+            fileSizeBytes: rawBytes.byteLength,
+            providerRequestId,
           };
         } else {
           throw new GnaniProviderError(
@@ -187,18 +368,25 @@ export class GnaniTimbreProvider {
         // Binary audio response
         audioBuffer = await response.arrayBuffer();
         const base64Audio = Buffer.from(audioBuffer).toString('base64');
-        const mimeType = request.audioConfig.container === 'mp3' ? 'audio/mpeg' : `audio/${request.audioConfig.container}`;
+        const mimeType =
+          request.audioConfig.container === 'mp3'
+            ? 'audio/mpeg'
+            : `audio/${request.audioConfig.container}`;
+        const exactDuration = getWavDurationFromBuffer(
+          audioBuffer,
+          validation.estimatedDurationSeconds
+        );
 
         return {
           id: `gen-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
           projectId: request.projectId,
           title: request.title || 'Live Timbre v3.0 Take',
           script: request.script,
-          voice: request.voice,
+          voice: resolvedVoice,
           language: request.language,
           audioConfig: request.audioConfig,
           audioUrl: `data:${mimeType};base64,${base64Audio}`,
-          durationSeconds: validation.estimatedDurationSeconds,
+          durationSeconds: exactDuration,
           wordCount: validation.wordCount,
           detectedTags: validation.detectedTags,
           createdAt: new Date().toISOString(),
@@ -206,12 +394,18 @@ export class GnaniTimbreProvider {
           generationMode: 'live-provider',
           isDemo: false,
           fileSizeBytes: audioBuffer.byteLength,
+          providerRequestId,
         };
       }
     } catch (err: unknown) {
       clearTimeout(timeoutId);
       if (err instanceof GnaniProviderError) throw err;
-      if (err && typeof err === 'object' && 'name' in err && (err as { name: string }).name === 'AbortError') {
+      if (
+        err &&
+        typeof err === 'object' &&
+        'name' in err &&
+        (err as { name: string }).name === 'AbortError'
+      ) {
         throw new GnaniProviderError(
           'Request to Gnani Timbre v3.0 timed out after 25 seconds.',
           504,

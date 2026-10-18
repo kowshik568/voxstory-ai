@@ -35,6 +35,7 @@ import {
   Volume1,
   Maximize2,
   FileAudio,
+  Upload,
 } from 'lucide-react';
 import { TimelineTrack, TimelineClip, TrackType, GenerationResult } from '../types';
 import {
@@ -280,6 +281,96 @@ export const MultitrackTimeline: React.FC<MultitrackTimelineProps> = ({
     setTracks([...tracks, newTrack]);
     setTimelineNotice(`Added new ${type} track lane`);
     setTimeout(() => setTimelineNotice(null), 3000);
+  };
+
+  const handleImportAudioTrack = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    if (file.size === 0) {
+      setTimelineNotice('Selected audio file is empty (0 bytes)');
+      setTimeout(() => setTimelineNotice(null), 4000);
+      return;
+    }
+
+    if (file.size > 15 * 1024 * 1024) {
+      setTimelineNotice(`File too large (${(file.size / (1024 * 1024)).toFixed(1)}MB). 15MB limit.`);
+      setTimeout(() => setTimelineNotice(null), 4000);
+      return;
+    }
+
+    setTimelineNotice('Importing and validating audio file...');
+
+    try {
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const dataUrl = reader.result as string;
+        try {
+          const resp = await fetch('/api/audio/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              filename: file.name,
+              dataUrl,
+              trackType: 'music',
+            }),
+          });
+
+          const res = await resp.json();
+          if (!resp.ok || !res.success) {
+            setTimelineNotice(`Import failed: ${res.error || 'Server error'}`);
+            setTimeout(() => setTimelineNotice(null), 5000);
+            return;
+          }
+
+          const asset = res.data;
+          pushHistory();
+
+          // Locate or create a music/ambience track lane
+          let targetTrack = tracks.find((t) => t.type === 'music' || t.type === 'ambience');
+          let currentTracks = tracks;
+          if (!targetTrack) {
+            targetTrack = {
+              id: `track-music-${Date.now()}`,
+              name: 'Imported Score',
+              type: 'music',
+              color: '#eab308',
+              isMuted: false,
+              isSolo: false,
+              volume: 1.0,
+              pan: 0.0,
+            };
+            currentTracks = [...tracks, targetTrack];
+            setTracks(currentTracks);
+          }
+
+          const newClip: TimelineClip = {
+            id: `clip-${asset.id}`,
+            trackId: targetTrack.id,
+            title: asset.filename.replace(/\.[^/.]+$/, ''),
+            startTime: playheadTime,
+            duration: asset.durationSeconds || 10,
+            volume: 1.0,
+            pan: 0.0,
+            fadeIn: 0.5,
+            fadeOut: 0.5,
+            audioUrl: asset.url,
+          };
+
+          setClips([...clips, newClip]);
+          setSelectedClipId(newClip.id);
+          setTimelineNotice(`Imported "${asset.filename}" (${asset.durationSeconds.toFixed(1)}s, ${asset.sampleRate}Hz WAV)`);
+          setTimeout(() => setTimelineNotice(null), 4000);
+        } catch (postErr) {
+          setTimelineNotice(`Import error: ${postErr instanceof Error ? postErr.message : String(postErr)}`);
+          setTimeout(() => setTimelineNotice(null), 5000);
+        }
+      };
+      reader.readAsDataURL(file);
+    } catch (err) {
+      setTimelineNotice(`Import error: ${err instanceof Error ? err.message : String(err)}`);
+      setTimeout(() => setTimelineNotice(null), 5000);
+    }
   };
 
   const handleDeleteTrack = (trackId: string) => {
@@ -617,6 +708,17 @@ export const MultitrackTimeline: React.FC<MultitrackTimelineProps> = ({
               </span>
             )}
           </div>
+
+          <label className="cursor-pointer flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-[#161824] hover:bg-purple-600/20 text-purple-300 hover:text-white border border-purple-500/30 text-xs font-semibold transition-colors">
+            <Upload className="w-3.5 h-3.5 text-purple-400" />
+            <span className="hidden sm:inline">Import Audio</span>
+            <input
+              type="file"
+              accept=".wav,audio/wav,audio/wave"
+              onChange={handleImportAudioTrack}
+              className="hidden"
+            />
+          </label>
 
           {onOpenMixer && (
             <button

@@ -53,12 +53,18 @@ describe('Generation Jobs API', () => {
 
     const jobId = body.jobId;
 
-    // Wait a brief moment for worker to complete
-    await new Promise((r) => setTimeout(r, 200));
+    // Poll for worker to complete (allowing network latency for live provider)
+    let statusBody: any = null;
+    for (let attempt = 0; attempt < 30; attempt++) {
+      const statusRes = await fetch(`${baseUrl}/jobs/${jobId}`);
+      expect(statusRes.status).toBe(200);
+      statusBody = await statusRes.json();
+      if (statusBody.data.status === 'completed' || statusBody.data.status === 'failed') {
+        break;
+      }
+      await new Promise((r) => setTimeout(r, 200));
+    }
 
-    const statusRes = await fetch(`${baseUrl}/jobs/${jobId}`);
-    expect(statusRes.status).toBe(200);
-    const statusBody = await statusRes.json();
     expect(statusBody.success).toBe(true);
     expect(statusBody.data.status).toBe('completed');
     expect(statusBody.data.result).toBeDefined();

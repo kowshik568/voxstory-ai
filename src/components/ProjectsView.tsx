@@ -1,7 +1,7 @@
 /**
- * VoxStory AI - My Projects Library (v4.0)
+ * VoxStory AI - My Projects Library (v13.0)
  * Precision project management with search, mode filtering,
- * duplicate, rename, delete, and direct studio opening.
+ * duplicate, rename, safe deletion confirmation, and direct studio opening.
  */
 
 import React, { useState } from 'react';
@@ -19,6 +19,8 @@ import {
   ArrowRight,
   MoreVertical,
   Check,
+  AlertTriangle,
+  X,
 } from 'lucide-react';
 import { StudioProject } from '../types';
 
@@ -45,6 +47,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
   const [filterMode, setFilterMode] = useState<'all' | 'solo' | 'dialogue'>('all');
   const [renamingId, setRenamingId] = useState<string | null>(null);
   const [newTitle, setNewTitle] = useState('');
+  const [projectToDelete, setProjectToDelete] = useState<StudioProject | null>(null);
 
   const filteredProjects = projects.filter((p) => {
     const matchesSearch =
@@ -74,8 +77,15 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
     setRenamingId(null);
   };
 
+  const confirmDelete = () => {
+    if (projectToDelete) {
+      onDeleteProject(projectToDelete.id);
+      setProjectToDelete(null);
+    }
+  };
+
   return (
-    <div className="flex-1 bg-[#0B0C10] overflow-y-auto p-6 lg:p-8 space-y-6">
+    <div className="flex-1 bg-[#0B0C10] overflow-y-auto p-4 sm:p-6 lg:p-8 space-y-6">
       {/* Top Banner & Search */}
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 border-b border-[#1A1C29] pb-6">
         <div>
@@ -122,7 +132,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
             onClick={() => setFilterMode('all')}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
               filterMode === 'all'
-                ? 'bg-violet-600 text-white shadow-sm'
+                ? 'bg-violet-600 text-white shadow-xs'
                 : 'text-[#8E92A8] hover:text-white'
             }`}
           >
@@ -132,7 +142,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
             onClick={() => setFilterMode('solo')}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
               filterMode === 'solo'
-                ? 'bg-violet-600 text-white shadow-sm'
+                ? 'bg-violet-600 text-white shadow-xs'
                 : 'text-[#8E92A8] hover:text-white'
             }`}
           >
@@ -142,7 +152,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
             onClick={() => setFilterMode('dialogue')}
             className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
               filterMode === 'dialogue'
-                ? 'bg-violet-600 text-white shadow-sm'
+                ? 'bg-violet-600 text-white shadow-xs'
                 : 'text-[#8E92A8] hover:text-white'
             }`}
           >
@@ -242,7 +252,7 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
                         <button
                           onClick={(e) => {
                             e.stopPropagation();
-                            onDeleteProject(p.id);
+                            setProjectToDelete(p);
                           }}
                           title="Delete Project"
                           className="p-1.5 rounded hover:bg-rose-950/30 text-[#71758C] hover:text-rose-400 transition-colors"
@@ -304,6 +314,40 @@ export const ProjectsView: React.FC<ProjectsViewProps> = ({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {projectToDelete && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-xs">
+          <div className="bg-[#12141F] border border-[#222538] rounded-xl shadow-2xl w-full max-w-sm p-5 space-y-4">
+            <div className="flex items-center gap-3">
+              <div className="w-10 h-10 rounded-full bg-rose-950/50 border border-rose-800/40 flex items-center justify-center text-rose-400 shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div>
+                <h3 className="text-sm font-semibold text-white">Delete Project</h3>
+                <p className="text-xs text-[#8E92A8] mt-0.5">
+                  Are you sure you want to delete &ldquo;{projectToDelete.title}&rdquo;? This cannot be undone.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-[#1E2130]">
+              <button
+                onClick={() => setProjectToDelete(null)}
+                className="px-3 py-1.5 text-xs text-[#8E92A8] hover:text-white rounded-lg hover:bg-[#1A1D2D] transition-colors"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={confirmDelete}
+                className="px-3.5 py-1.5 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors"
+              >
+                Delete Project
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>
